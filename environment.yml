@@ -1,0 +1,17 @@
+name: brain_tr_gammaknife
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - cudatoolkit=11.8.0
+  - pytorch=2.6.0
+  - torchvision
+  - numpy
+  - matplotlib
+  - tqdm
+  - pip
+  - pip:
+      - pydicom==2.4.0
+      - napari
