@@ -8,10 +8,15 @@ dependencies:
   - cudatoolkit=11.8.0
   - pytorch=2.6.0
   - torchvision
-  - numpy
+  # - numpy
+  - numpy<2.0  # Downgrade NumPy to a compatible version (1.26.x) for radiomics. Lots of obscene lexic here.
   - matplotlib
   - tqdm
   - pip
+  - openpyxl # to read .xlsx files
+  - simpleitk # medical image processing
   - pip:
       - pydicom==2.4.0
       - napari
+      - pynrrd
+      - pyradiomics # pyradiomics feature extraction
