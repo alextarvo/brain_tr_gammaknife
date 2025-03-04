@@ -15,6 +15,8 @@ dependencies:
   - pip
   - openpyxl # to read .xlsx files
   - simpleitk # medical image processing
+  - scikit-learn
+  - seaborn
   - pip:
       - pydicom==2.4.0
       - napari
