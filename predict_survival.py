@@ -12,6 +12,8 @@ from tqdm import tqdm
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 import sklearn.model_selection as ms
 from sklearn.metrics import classification_report
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 import sksurv
 from sksurv.nonparametric import kaplan_meier_estimator
 from sksurv.ensemble import RandomSurvivalForest
@@ -110,15 +112,51 @@ def plot_survival_curve(X, y):
 
 def predict_recurrence_survival(splits):
     c_scores = []
-    rsf = RandomSurvivalForest(n_estimators=40, min_samples_split=10)
+    rsf = RandomSurvivalForest(n_estimators=40, min_samples_leaf=1)
     for i, (X_train, y_train, X_test, y_test) in enumerate(splits):
         train_surv_data = sksurv.util.Surv.from_arrays(event=y_train, time=X_train['DURATION_TO_IMAG'])
         test_surv_data = sksurv.util.Surv.from_arrays(event=y_test, time=X_test['DURATION_TO_IMAG'])
         X_train = X_train.drop(columns=['DURATION_TO_IMAG'])
         X_test = X_test.drop(columns=['DURATION_TO_IMAG'])
+
         # Fit model to the current split
-        rsf.fit(X_train, train_surv_data)
+        # Weigh "event" samples to 10
+        sample_weight = np.where(y_train == 1, 10.0, 1.0)
+        rsf.fit(X_train, train_surv_data, sample_weight=sample_weight)
+
         risk_scores = rsf.predict(X_test)
+
+        #
+        # Here, plot Kaplan-Meier scores for survival vs. non-survival
+        #
+        pred_survival_funcs = rsf.predict_survival_function(X_test)
+        event_occurred_idx = np.where(y_test == 1)[0]  # Indices where event = 1
+        # censored_idx = np.where(y_test == 0)[0]  # Indices where event = 0
+        # num_events = len(event_occurred_idx)  # Count of actual events
+        # selected_censored_idx = np.random.choice(censored_idx, size=num_events, replace=False)  # Random selection
+        event_curves = pred_survival_funcs[event_occurred_idx]
+        # censored_curves = pred_survival_funcs[selected_censored_idx]
+
+        time, survival_prob, conf_int = kaplan_meier_estimator(
+            train_surv_data['event'], train_surv_data['time'], conf_type='log-log'
+        )
+        plt.figure(figsize=(8, 6))
+        for i, sf in enumerate(event_curves):
+            plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="red", alpha=0.7,
+                     label="Event" if i == 0 else "")
+        plt.step(time, survival_prob, where="post")
+        plt.fill_between(time, conf_int[0], conf_int[1], alpha=0.25, step="post")
+
+        # for i, sf in enumerate(censored_curves):
+        #     plt.step(sf.x, sf(sf.x), where="post", linestyle="--", color="red", alpha=0.7,
+        #              label="Censored" if i == 0 else "")
+
+        plt.xlabel("Time")
+        plt.ylabel("Survival Probability")
+        plt.title("Survival Function: Survivors (Green) vs. Non-Survivors (Red)")
+        plt.legend()
+        plt.show()
+
         c_index = concordance_index_censored(test_surv_data["event"], test_surv_data["time"], risk_scores)[0]
         print(f'c-score for split {i}: {c_index}')
         c_scores.append(c_index)
@@ -150,9 +188,17 @@ if __name__ == "__main__":
     df_lesion_metrics['target'] = df_lesion_metrics['MRI_TYPE'].map({'recurrence': 1, 'stable': 0})
     df_lesion_metrics['gender_id'] = df_lesion_metrics['PATIENT_GENDER'].map({'Male': 1, 'Female': 0})
 
+    # Apply TF-IDF encoding
+    vectorizer = TfidfVectorizer(lowercase=True, stop_words=['brain','met','mets','with', 'ca'])
+    text_features = vectorizer.fit_transform(df_lesion_metrics["PATIENT_DIAGNOSIS_METS"])
+    print(vectorizer.get_feature_names_out())
+    text_features_df = pd.DataFrame(text_features.toarray(), columns=vectorizer.get_feature_names_out())
+    df_lesion_metrics = pd.concat([df_lesion_metrics.drop(columns=["PATIENT_DIAGNOSIS_METS"]), text_features_df], axis=1)
+
+
     X = df_lesion_metrics.drop(
-        columns=['target', 'PT_ID', 'LESION_COURSE_NO', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
-                 'PATIENT_AGE', 'PATIENT_GENDER', 'MRI_TYPE'])
+        columns=['target', 'PT_ID', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY', #'PATIENT_DIAGNOSIS_METS',
+                 'PATIENT_GENDER', 'MRI_TYPE'])
     # This is an index column
     # X = X.iloc[:, 1:]
     y = df_lesion_metrics['target']
