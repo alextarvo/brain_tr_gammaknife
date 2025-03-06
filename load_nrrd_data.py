@@ -118,14 +118,19 @@ if __name__ == "__main__":
       # Read MRI image and its metadata. Note: here we use ITK as it seems to be a more
       # capable library.
       mri_path = os.path.join(args.nrrd_dataset_path, patient_course_id, f'{patient_course_id}_MR_t1.nrrd')
+      tumor_mask_path = os.path.join(args.nrrd_dataset_path, patient_course_id, f'{lesion_file_name}.nrrd')
 
-      mri_data, mri_image, mri_metadata = read_nrrd_and_metadata(mri_path)
+      # if not os.path.exists(mri_path):
+      #     print(f'MRI file {mri_path} does not exist!')
+      # if not os.path.exists(tumor_mask_path):
+      #     print(f'Tumor file {tumor_mask_path} does not exist!')
+
 
       # We could use nrrd, as below. But all the examples are for ITK... so let''s go with ITK
       # tumor_data, tumor_header = nrrd.read(tumor_mask_path)
+      mri_data, mri_image, mri_metadata = read_nrrd_and_metadata(mri_path)
 
       # Read the tumor mask
-      tumor_mask_path = os.path.join(args.nrrd_dataset_path, patient_course_id, f'{lesion_file_name}.nrrd')
       tumor_data, tumor_image, tumor_metadata = read_nrrd_and_metadata(mri_path)
 
       # Do some sanity check for images and metadata.
@@ -160,7 +165,6 @@ if __name__ == "__main__":
               'DURATION_TO_IMAG': row['DURATION_TO_IMAG'],
               'MRI_TYPE': row['MRI_TYPE'],
           }
-
 
           features = extractor.execute(mri_path, tumor_mask_path)
           # for key, value in features.items():
