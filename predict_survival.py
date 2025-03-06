@@ -12,6 +12,10 @@ from tqdm import tqdm
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 import sklearn.model_selection as ms
 from sklearn.metrics import classification_report
+import sksurv
+from sksurv.nonparametric import kaplan_meier_estimator
+from sksurv.ensemble import RandomSurvivalForest
+from sksurv.metrics import concordance_index_censored
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -55,7 +59,8 @@ def select_variables_rf(X, y, ntrees, max_tree_depth, visualize=False):
         plt.title(f"Feature cross-correlation for survival prediction")
         plt.yticks(range(top_metrics.shape[1]), top_metrics.columns)
         plt.subplots_adjust(left=0.4, bottom=0.1, right=0.9, top=0.9)
-        plt.show()
+        # plt.show()
+        print('1')
 
     return top_N_features, top_N_features_gini, top_metrics
 
@@ -91,22 +96,35 @@ def get_random_splits(X, y, n_splits):
 TOP_N_METRICS = 20
 N_SPLITS = 10
 
-if __name__ == "__main__":
-    args = get_args()
-    df_lesion_metrics = pd.read_csv(args.lesion_metrics_file, header=0, index_col=0)
-    df_lesion_metrics['target'] = df_lesion_metrics['MRI_TYPE'].map({'recurrence': 1, 'stable': 0})
-    df_lesion_metrics['gender_id'] = df_lesion_metrics['PATIENT_GENDER'].map({'Male': 1, 'Female': 0})
+def plot_survival_curve(X, y):
+    surv_data=sksurv.util.Surv.from_arrays(event=y,time=X['DURATION_TO_IMAG'])
+    time, survival_prob, conf_int = kaplan_meier_estimator(
+        surv_data['event'], surv_data['time'], conf_type='log-log'
+    )
+    plt.step(time, survival_prob, where="post")
+    plt.fill_between(time, conf_int[0], conf_int[1], alpha=0.25, step="post")
+    plt.ylim(0, 1)
+    plt.ylabel(r"est. probability of survival $\hat{S}(t)$")
+    plt.xlabel("time $t$")
+    plt.plot()
 
-    X = df_lesion_metrics.drop(
-        columns=['target', 'PT_ID', 'LESION_COURSE_NO', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
-                 'PATIENT_AGE', 'PATIENT_GENDER', 'DURATION_TO_IMAG', 'MRI_TYPE'])
-    # This is an index column
-    # X = X.iloc[:, 1:]
-    y = df_lesion_metrics['target']
-    # top_N_features, top_N_features_gini, top_metrics = select_variables_rf(
-    #     X, y, ntrees=20, max_tree_depth=10)
+def predict_recurrence_survival(splits):
+    c_scores = []
+    rsf = RandomSurvivalForest(n_estimators=40, min_samples_split=10)
+    for i, (X_train, y_train, X_test, y_test) in enumerate(splits):
+        train_surv_data = sksurv.util.Surv.from_arrays(event=y_train, time=X_train['DURATION_TO_IMAG'])
+        test_surv_data = sksurv.util.Surv.from_arrays(event=y_test, time=X_test['DURATION_TO_IMAG'])
+        X_train = X_train.drop(columns=['DURATION_TO_IMAG'])
+        X_test = X_test.drop(columns=['DURATION_TO_IMAG'])
+        # Fit model to the current split
+        rsf.fit(X_train, train_surv_data)
+        risk_scores = rsf.predict(X_test)
+        c_index = concordance_index_censored(test_surv_data["event"], test_surv_data["time"], risk_scores)[0]
+        print(f'c-score for split {i}: {c_index}')
+        c_scores.append(c_index)
+    print(f'Mean c-scores: {np.mean(c_scores)}')
 
-    splits = get_random_splits(X, y, 10)
+def predict_recurrence_classification(splits):
     model = AdaBoostClassifier(n_estimators=80)
     # model = RandomForestClassifier(n_estimators=80,
     #                                min_impurity_decrease=0.1,
@@ -124,3 +142,24 @@ if __name__ == "__main__":
         print(f'Predicted: {y_pred}')
         print(f'Real:      {np.asarray(y_test)}')
         print("\n")
+
+
+if __name__ == "__main__":
+    args = get_args()
+    df_lesion_metrics = pd.read_csv(args.lesion_metrics_file, header=0, index_col=0)
+    df_lesion_metrics['target'] = df_lesion_metrics['MRI_TYPE'].map({'recurrence': 1, 'stable': 0})
+    df_lesion_metrics['gender_id'] = df_lesion_metrics['PATIENT_GENDER'].map({'Male': 1, 'Female': 0})
+
+    X = df_lesion_metrics.drop(
+        columns=['target', 'PT_ID', 'LESION_COURSE_NO', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
+                 'PATIENT_AGE', 'PATIENT_GENDER', 'MRI_TYPE'])
+    # This is an index column
+    # X = X.iloc[:, 1:]
+    y = df_lesion_metrics['target']
+    # top_N_features, top_N_features_gini, top_metrics = select_variables_rf(
+    #     X, y, ntrees=20, max_tree_depth=10)
+
+    plot_survival_curve(X, y)
+
+    splits = get_random_splits(X, y, 10)
+    predict_recurrence_survival(splits)
