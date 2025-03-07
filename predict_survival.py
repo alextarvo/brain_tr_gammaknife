@@ -113,7 +113,7 @@ def plot_survival_curve(X, y):
 def predict_recurrence_survival(splits):
     c_scores = []
     rsf = RandomSurvivalForest(n_estimators=40, min_samples_leaf=1)
-    for i, (X_train, y_train, X_test, y_test) in enumerate(splits):
+    for split_idx, (X_train, y_train, X_test, y_test) in enumerate(splits):
         train_surv_data = sksurv.util.Surv.from_arrays(event=y_train, time=X_train['DURATION_TO_IMAG'])
         test_surv_data = sksurv.util.Surv.from_arrays(event=y_test, time=X_test['DURATION_TO_IMAG'])
         X_train = X_train.drop(columns=['DURATION_TO_IMAG'])
@@ -131,7 +131,7 @@ def predict_recurrence_survival(splits):
         #
         pred_survival_funcs = rsf.predict_survival_function(X_test)
         event_occurred_idx = np.where(y_test == 1)[0]  # Indices where event = 1
-        # censored_idx = np.where(y_test == 0)[0]  # Indices where event = 0
+        censored_idx = np.where(y_test == 0)[0]  # Indices where event = 0
         # num_events = len(event_occurred_idx)  # Count of actual events
         # selected_censored_idx = np.random.choice(censored_idx, size=num_events, replace=False)  # Random selection
         event_curves = pred_survival_funcs[event_occurred_idx]
@@ -140,6 +140,9 @@ def predict_recurrence_survival(splits):
         time, survival_prob, conf_int = kaplan_meier_estimator(
             train_surv_data['event'], train_surv_data['time'], conf_type='log-log'
         )
+        # time, survival_prob, conf_int = kaplan_meier_estimator(
+        #     test_surv_data['event'][censored_idx], test_surv_data['time'][censored_idx], conf_type='log-log'
+        # )
         plt.figure(figsize=(8, 6))
         for i, sf in enumerate(event_curves):
             plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="red", alpha=0.7,
@@ -153,12 +156,12 @@ def predict_recurrence_survival(splits):
 
         plt.xlabel("Time")
         plt.ylabel("Survival Probability")
-        plt.title("Survival Function: Survivors (Green) vs. Non-Survivors (Red)")
+        plt.title(f"Survival Function: Non-Survivors (Red) vs. average. Split: {split_idx}")
         plt.legend()
         plt.show()
 
         c_index = concordance_index_censored(test_surv_data["event"], test_surv_data["time"], risk_scores)[0]
-        print(f'c-score for split {i}: {c_index}')
+        print(f'c-score for split {split_idx}: {c_index}')
         c_scores.append(c_index)
     print(f'Mean c-scores: {np.mean(c_scores)}')
 
