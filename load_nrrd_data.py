@@ -82,6 +82,10 @@ def get_args():
     parser.add_argument("--patches_output_path",
                         help='Path to the write the .npy files that contain extracted patches with tumors',
                         type=str)
+    parser.add_argument("--radiomics_extractor", help='Type of a radiomics metrics extractor to use',
+                        type=str, choices=['pyradiomics', 'fcib', 'none'], default='pyradiomics')
+    parser.add_argument("--output_patches_path", help='The path where we may output patches',
+                        type=str, default='')
     args = parser.parse_args()
     return args
 
@@ -181,8 +185,9 @@ def extract_central_slices(mri_image, tumor_mask):
     # show_slice(mri_image[:, :, center_3], tumor_mask[:, :, center_3])
 
     center = (center_1, center_2, center_3)
-    dims_corrected = np.array((minc_1, maxc_1), (minc_2, maxc_2), (minc_3, maxc_3))
-    dims_uncorrected = np.array((min_1, max_1), (min_2, max_2), (min_3, max_3))
+    # dims_corrected[0] min/max  coordinates along a first dimension
+    dims_corrected = np.array(((minc_1, maxc_1), (minc_2, maxc_2), (minc_3, maxc_3)))
+    dims_uncorrected = np.array(((min_1, max_1), (min_2, max_2), (min_3, max_3)))
 
     return center, dims_uncorrected, dims_corrected
 
@@ -218,37 +223,51 @@ def boxes_intersect(box1: np.array, box2: np.array) -> bool:
     return x_overlap and y_overlap and z_overlap
 
 
-def create_finetuning_dataset(dataset_path, lesion_infos, lesion_free_factor):
+def create_finetuning_dataset(dataset_path, lesion_infos, lesion_free_factor, prob_train=0.75):
     if dataset_path is not None:
-        os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
+        os.makedirs(dataset_path, exist_ok=True)
+    train_path = os.path.join(dataset_path, 'train')
+    test_path = os.path.join(dataset_path, 'test')
+    os.makedirs(train_path, exist_ok=True)
+    os.makedirs(test_path, exist_ok=True)
+
     for lesion_idx in range(len(lesion_infos)):
-        lesion_info = lesion_infos[lesion_idx]
-        lesion_id = f'{lesion_info.patient_id}_{lesion_info.lesion_course_no}_{lesion_info.lesion_course_no}'
-        lesion_dims = lesion_id.lesion_dimensions
-        np.save("lesion_{lesion_id}.npy", lesion_info.mri_lesion_image)
+        test_flag = random.uniform(0, 1)
+        path = train_path if test_flag < prob_train else test_path
+
+        lesion = lesion_infos[lesion_idx]
+        lesion_id = f'{lesion.patient_id}_{lesion.lesion_no}_{lesion.lesion_course_no}'
+        # print(lesion_id)
+        lesion_dims = lesion.lesion_dimensions
+        np.save(os.path.join(path, f'lesion_{lesion_id}.npy'), lesion.mri_lesion_image)
         num_lesion_free_generated = 0
         while num_lesion_free_generated < lesion_free_factor:
             other_idx = random.randint(0, len(lesion_infos) - 1)
             if other_idx == lesion_idx:
                 continue
             other_lesion = lesion_infos[other_idx]
-            if boxes_intersect(lesion_info.lesion_dimensions, other_lesion.lesion_dimensions):
+            if boxes_intersect(lesion.lesion_dimensions, other_lesion.lesion_dimensions):
                 # There's a lesion in another image in exactly same area!
                 continue
-            lesion_free_slice = other_lesion[
+            other_lesion_id = f'{other_lesion.patient_id}_{other_lesion.lesion_course_no}_{other_lesion.lesion_course_no}'
+            lesion_free_slice = other_lesion.mri_image[
                                 lesion_dims[0][0]:lesion_dims[0][1],
                                 lesion_dims[1][0]:lesion_dims[1][1],
                                 lesion_dims[2][0]: lesion_dims[2][1]]
-            lesion_free_id = f'{other_lesion.patient_id}_{other_lesion.lesion_course_no}__{num_lesion_free_generated}'
-            np.save("free_{lesion_id}.npy", lesion_free_id)
+            lesion_free_id = f'{lesion_id}_{other_lesion_id}__{num_lesion_free_generated}'
+            np.save(os.path.join(path, f'free_{lesion_free_id}.npy'), lesion_free_slice)
+            num_lesion_free_generated += 1
 
 
 if __name__ == "__main__":
     args = get_args()
     df_merged = load_clinical_metadata(args.metadata_file)
-    # extractor = ri.PyRadiomicsExtractor()
-    extractor = ri.FCIBImageExtractor()
-    # df_output = pd.DataFrame()
+    if args.radiomics_extractor == 'pyradiomics':
+        extractor = ri.PyRadiomicsExtractor()
+    elif args.radiomics_extractor == 'fcib':
+        extractor = ri.FCIBImageExtractor()
+    else:
+        extractor = None
 
     metrics = []
 
@@ -261,7 +280,6 @@ if __name__ == "__main__":
         os.makedirs(os.path.dirname(args.patches_output_path), exist_ok=True)
 
     for index, row in tqdm(df_merged.iterrows(), total=len(df_merged), desc="Processing lesions"):
-        # for index, row in df_merged.iterrows():
         patient_id = row['PT_ID']
         lesion_id = row['LESION_NO']
         course_id = row['LESION_COURSE_NO']
@@ -315,9 +333,9 @@ if __name__ == "__main__":
                               dims_corrected[2][0]: dims_corrected[2][1]
                               ]
 
-        lesion_info = LesionInfo(patient_id, lesion_id, course_id,
-                                 mri_image, dims_corrected, extracted_mri_slice)
-        lesions_infos.append(lesion_info)
+        lesion = LesionInfo(patient_id, lesion_id, course_id,
+                            mri_image, dims_corrected, extracted_mri_slice)
+        lesions_infos.append(lesion)
         # entry_patch = {
         #     'PT_ID': row['PT_ID'],
         #     'LESION_COURSE_NO': row['LESION_COURSE_NO'],
@@ -353,22 +371,25 @@ if __name__ == "__main__":
                 'DURATION_TO_IMAG': row['DURATION_TO_IMAG'],
                 'MRI_TYPE': row['MRI_TYPE'],
             }
-
-            # filtered_metrics = extractor.extract_features(
-            #     mri_path=mri_path, tumor_mask_path=tumor_mask_path)
-            filtered_metrics = extractor.extract_features(
-                image_patch=extracted_mri_slice)
-            entry.update(filtered_metrics)
-            metrics.append(entry)
+            if extractor is not None:
+                filtered_metrics = extractor.extract_features(
+                    mri_path=mri_path, tumor_mask_path=tumor_mask_path,
+                    image_patch=extracted_mri_slice)
+                entry.update(filtered_metrics)
+                metrics.append(entry)
 
         except:
             logging.exception(
                 f"Error while extracting features from the MRI file {mri_path}, tumor mask file {tumor_mask_path}")
 
-    df_metrics = pd.DataFrame(metrics)
+    if len(metrics) > 0:
+        df_metrics = pd.DataFrame(metrics)
+        if args.metrics_output_path is not None:
+            os.makedirs(os.path.dirname(args.metrics_output_path), exist_ok=True)
+        df_metrics.to_csv(args.metrics_output_path)
 
-    if args.metrics_output_path is not None:
-        os.makedirs(os.path.dirname(args.metrics_output_path), exist_ok=True)
-    df_metrics.to_csv(args.metrics_output_path)
+    if args.output_patches_path:
+        print(f'Outputting finetuning dataset to {args.output_patches_path}')
+        create_finetuning_dataset(args.output_patches_path, lesions_infos, 3)
 
     logging.info('Done processing!')

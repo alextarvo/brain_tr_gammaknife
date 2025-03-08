@@ -2,6 +2,7 @@ import argparse
 import random
 import torch
 from fmcib.models import fmcib_model
+from torch.utils.data import Dataset
 
 import numpy as np
 import torch.nn.functional as F
@@ -32,3 +33,10 @@ class FCIBUptune(nn.Module):
       interim_activated = self.interim_af(classifier_interim)
       classifier_output = self.classifier_head(interim_activated)
       return classifier_output
+
+class FCIBUptuneDataset(Dataset):
+    def __init__(self, dataset_dir: str, split:str):
+        super().__init__()
+        self.dataset_dir = dataset_dir
+        self.split = split
+

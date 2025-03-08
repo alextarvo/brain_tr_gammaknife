@@ -9,8 +9,9 @@ channels:
 dependencies:
   - python=3.9
   - cudatoolkit=11.8.0
-  - pytorch=2.6.0
+  - pytorch=2.6.0=*cuda*
   - torchvision
+  - pytorch-cuda=11.8
   # - numpy
   - numpy<2.0  # Downgrade NumPy to a compatible version (1.26.x) for radiomics. Lots of obscene lexic here.
   - matplotlib
@@ -26,3 +27,4 @@ dependencies:
       - napari
       - pynrrd
       - pyradiomics # pyradiomics feature extraction
+      - foundation-cancer-image-biomarker

@@ -140,25 +140,26 @@ def predict_recurrence_survival(splits):
         time, survival_prob, conf_int = kaplan_meier_estimator(
             train_surv_data['event'], train_surv_data['time'], conf_type='log-log'
         )
-        # time, survival_prob, conf_int = kaplan_meier_estimator(
-        #     test_surv_data['event'][censored_idx], test_surv_data['time'][censored_idx], conf_type='log-log'
-        # )
-        plt.figure(figsize=(8, 6))
-        for i, sf in enumerate(event_curves):
-            plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="red", alpha=0.7,
-                     label="Event" if i == 0 else "")
-        plt.step(time, survival_prob, where="post")
-        plt.fill_between(time, conf_int[0], conf_int[1], alpha=0.25, step="post")
 
-        # for i, sf in enumerate(censored_curves):
-        #     plt.step(sf.x, sf(sf.x), where="post", linestyle="--", color="red", alpha=0.7,
-        #              label="Censored" if i == 0 else "")
-
-        plt.xlabel("Time")
-        plt.ylabel("Survival Probability")
-        plt.title(f"Survival Function: Non-Survivors (Red) vs. average. Split: {split_idx}")
-        plt.legend()
-        plt.show()
+        # # time, survival_prob, conf_int = kaplan_meier_estimator(
+        # #     test_surv_data['event'][censored_idx], test_surv_data['time'][censored_idx], conf_type='log-log'
+        # # )
+        # plt.figure(figsize=(8, 6))
+        # for i, sf in enumerate(event_curves):
+        #     plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="red", alpha=0.7,
+        #              label="Event" if i == 0 else "")
+        # plt.step(time, survival_prob, where="post")
+        # plt.fill_between(time, conf_int[0], conf_int[1], alpha=0.25, step="post")
+        #
+        # # for i, sf in enumerate(censored_curves):
+        # #     plt.step(sf.x, sf(sf.x), where="post", linestyle="--", color="red", alpha=0.7,
+        # #              label="Censored" if i == 0 else "")
+        #
+        # plt.xlabel("Time")
+        # plt.ylabel("Survival Probability")
+        # plt.title(f"Survival Function: Non-Survivors (Red) vs. average. Split: {split_idx}")
+        # plt.legend()
+        # plt.show()
 
         c_index = concordance_index_censored(test_surv_data["event"], test_surv_data["time"], risk_scores)[0]
         print(f'c-score for split {split_idx}: {c_index}')
@@ -208,6 +209,7 @@ if __name__ == "__main__":
     # top_N_features, top_N_features_gini, top_metrics = select_variables_rf(
     #     X, y, ntrees=20, max_tree_depth=10)
 
+    # Surivval curve averaged across the whole dataset
     plot_survival_curve(X, y)
 
     splits = get_random_splits(X, y, 10)
