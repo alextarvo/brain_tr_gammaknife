@@ -3,7 +3,7 @@ import gpytorch
 from torch.distributions import Poisson, Uniform
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.variational import VariationalStrategy
-from gpytorch.variational import CholeskyVariationalDistribution
+from gpytorch.variational import VariationalDistribution
 from gpytorch.kernels import ScaleKernel
 from gpytorch.kernels import RBFKernel
 
@@ -23,7 +23,7 @@ def Lambda0(t, beta=beta, alpha=alpha):
     return 2 * beta / alpha * t**alpha
 
 def Lambda0_inv(u, beta=beta, alpha=alpha):
-    # Inverse of \Gamma_0(t): solve u = 2β/α * t^α for t.
+    # Inverse of \Gamma_0(t)
     return (alpha * u / (2 * beta))**(1 / alpha)
 
 def sigma(x):
@@ -74,7 +74,7 @@ def augment_data(T, X, beta=beta, alpha=alpha):
 # NOTE - Requires Zero mean and stationary Kernel for Survival Function properties to be ensured
 class SurvivalGPModel(gpytorch.models.ApproximateGP):
     def __init__(self, inducing_points):
-        variational_distribution =CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_distribution = VariationalDistribution(inducing_points.size(0))
         variational_strategy = VariationalStrategy(
             self, inducing_points, variational_distribution, learn_inducing_locations=True
         )
@@ -93,7 +93,7 @@ likelihood = gpytorch.likelihoods.BernoulliLikelihood()
 
 # Trainnig GP - Since we non-normal likelihood, cannot use ExactGP, use inducing points 
 # Variational Approx of Posterior
-def train_survival_gp(T, X, num_epochs=5_000):
+def train_survival_gp(T, X, num_epochs=1_000):
     # Augment the data:
     aug_times, aug_X, aug_labels = augment_data(T, X)
     # Combine time and covariates into a single input feature: [t, x_1, ..., x_d]
