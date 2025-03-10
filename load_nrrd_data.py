@@ -55,6 +55,11 @@ CLINICAL_INFO_COURSE_COLUMNS_NAMES = [name for name, value in globals().items() 
 MIN_PATCH_DIM = 20
 
 
+# Fix the random seed.
+def seed_everything(seed=11711):
+  random.seed(seed)
+  np.random.seed(seed)
+
 @dataclass
 class LesionInfo:
     patient_id: int
@@ -63,6 +68,7 @@ class LesionInfo:
     mri_image: np.ndarray
     lesion_dimensions: np.ndarray
     mri_lesion_image: np.ndarray
+    tumor_mask_image: np.ndarray
 
 
 def get_args():
@@ -83,8 +89,10 @@ def get_args():
                         help='Path to the write the .npy files that contain extracted patches with tumors',
                         type=str)
     parser.add_argument("--radiomics_extractor", help='Type of a radiomics metrics extractor to use',
-                        type=str, choices=['pyradiomics', 'fcib', 'none'], default='pyradiomics')
+                        type=str, choices=['pyradiomics', 'fcib', 'fcib_uptuned', 'none'], default='pyradiomics')
     parser.add_argument("--output_patches_path", help='The path where we may output patches',
+                        type=str, default='')
+    parser.add_argument("--fcib_uptuned_weights", help='The path where the weights of FCIB uptuned model are saved',
                         type=str, default='')
     args = parser.parse_args()
     return args
@@ -196,7 +204,7 @@ def show_slice(slice, mask=None):
     plt.figure(figsize=(6, 6))
     plt.imshow(slice, cmap="gray")
     if mask is not None:
-        plt.imshow(mask, cmap="Blues", alpha=0.3)
+        plt.imshow(mask, cmap="Blues", alpha=0.2)
     plt.axis("off")
     plt.show()
 
@@ -224,6 +232,17 @@ def boxes_intersect(box1: np.array, box2: np.array) -> bool:
 
 
 def create_finetuning_dataset(dataset_path, lesion_infos, lesion_free_factor, prob_train=0.75):
+    def show_lesion(lesion_image, tumor_mask_image, lesion_dimensions):
+        mid_section = ((lesion_dimensions[:, 1]-lesion_dimensions[:,0])/2).astype(int)
+        if tumor_mask_image is not None:
+            show_slice(lesion_image[mid_section[0], :, :], tumor_mask_image[mid_section[0],:,:])
+            show_slice(lesion_image[:, mid_section[1], :], tumor_mask_image[:, mid_section[1], :])
+            show_slice(lesion_image[:, :, mid_section[2]], tumor_mask_image[:, :, mid_section[2]])
+        else:
+            show_slice(lesion_image[mid_section[0], :, :], None)
+            show_slice(lesion_image[:, mid_section[1], :], None)
+            show_slice(lesion_image[:, :, mid_section[2]], None)
+
     if dataset_path is not None:
         os.makedirs(dataset_path, exist_ok=True)
     train_path = os.path.join(dataset_path, 'train')
@@ -239,24 +258,35 @@ def create_finetuning_dataset(dataset_path, lesion_infos, lesion_free_factor, pr
         lesion_id = f'{lesion.patient_id}_{lesion.lesion_no}_{lesion.lesion_course_no}'
         # print(lesion_id)
         lesion_dims = lesion.lesion_dimensions
+
+        # Debug only
+        # show_lesion(lesion.mri_lesion_image, lesion.tumor_mask_image, lesion_dims)
+
+        pat_id_used = {lesion.patient_id}
         np.save(os.path.join(path, f'lesion_{lesion_id}.npy'), lesion.mri_lesion_image)
         num_lesion_free_generated = 0
         while num_lesion_free_generated < lesion_free_factor:
             other_idx = random.randint(0, len(lesion_infos) - 1)
-            if other_idx == lesion_idx:
-                continue
             other_lesion = lesion_infos[other_idx]
-            if boxes_intersect(lesion.lesion_dimensions, other_lesion.lesion_dimensions):
-                # There's a lesion in another image in exactly same area!
+            if other_lesion.patient_id in pat_id_used:
+                # Do NOT  use the same patient for getting a  "lesion-free" image - as lesion instances are per tumor.
+                # It is possible that we will pick the MRI image for same person/treatment, just a different lesion id.
+                # In this case, we will "cut" the image of the "current" tumor - just from other_lesion instance.
                 continue
-            other_lesion_id = f'{other_lesion.patient_id}_{other_lesion.lesion_course_no}_{other_lesion.lesion_course_no}'
+            if boxes_intersect(lesion.lesion_dimensions, other_lesion.lesion_dimensions):
+                # There's a lesion in another image in exactly same area for a different patient!
+                continue
+            other_lesion_id = f'{other_lesion.patient_id}_{other_lesion.lesion_no}_{other_lesion.lesion_course_no}'
             lesion_free_slice = other_lesion.mri_image[
                                 lesion_dims[0][0]:lesion_dims[0][1],
                                 lesion_dims[1][0]:lesion_dims[1][1],
                                 lesion_dims[2][0]: lesion_dims[2][1]]
+            # Debug only
+            # show_lesion(lesion_free_slice, None, lesion_dims)
             lesion_free_id = f'{lesion_id}_{other_lesion_id}__{num_lesion_free_generated}'
             np.save(os.path.join(path, f'free_{lesion_free_id}.npy'), lesion_free_slice)
             num_lesion_free_generated += 1
+            pat_id_used.add(other_lesion.patient_id)
 
 
 if __name__ == "__main__":
@@ -266,8 +296,12 @@ if __name__ == "__main__":
         extractor = ri.PyRadiomicsExtractor()
     elif args.radiomics_extractor == 'fcib':
         extractor = ri.FCIBImageExtractor()
+    elif args.radiomics_extractor == 'fcib_uptuned':
+        extractor = ri.FCIBTunedImageExtractor(args.fcib_uptuned_weights)
     else:
         extractor = None
+
+    seed_everything()
 
     metrics = []
 
@@ -287,6 +321,9 @@ if __name__ == "__main__":
         patient_course_id = f'GK.{patient_id}_{course_id}'
 
         logging.info(f'Examining patient {patient_id}, course id {course_id}')
+        # Debug only
+        # if row['MRI_TYPE'] != 'recurrence':
+        #     continue
 
         # Read MRI image and its metadata. Note: here we use ITK as it seems to be a more
         # capable library.
@@ -332,9 +369,14 @@ if __name__ == "__main__":
                               dims_corrected[1][0]:dims_corrected[1][1],
                               dims_corrected[2][0]: dims_corrected[2][1]
                               ]
+        extracted_tumor_slice = tumor_image[
+                              dims_corrected[0][0]:dims_corrected[0][1],
+                              dims_corrected[1][0]:dims_corrected[1][1],
+                              dims_corrected[2][0]: dims_corrected[2][1]
+                              ]
 
         lesion = LesionInfo(patient_id, lesion_id, course_id,
-                            mri_image, dims_corrected, extracted_mri_slice)
+                            mri_image, dims_corrected, extracted_mri_slice, extracted_tumor_slice)
         lesions_infos.append(lesion)
         # entry_patch = {
         #     'PT_ID': row['PT_ID'],
@@ -388,7 +430,7 @@ if __name__ == "__main__":
             os.makedirs(os.path.dirname(args.metrics_output_path), exist_ok=True)
         df_metrics.to_csv(args.metrics_output_path)
 
-    if args.output_patches_path:
+    if args.output_patches_path is not None and args.output_patches_path != '':
         print(f'Outputting finetuning dataset to {args.output_patches_path}')
         create_finetuning_dataset(args.output_patches_path, lesions_infos, 3)
 

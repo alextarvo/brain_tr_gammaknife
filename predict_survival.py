@@ -121,7 +121,8 @@ def predict_recurrence_survival(splits):
 
         # Fit model to the current split
         # Weigh "event" samples to 10
-        sample_weight = np.where(y_train == 1, 10.0, 1.0)
+        # sample_weight = np.where(y_train == 1, 10.0, 1.0)
+        sample_weight = np.where(y_train == 1, 4.0, 1.0)
         rsf.fit(X_train, train_surv_data, sample_weight=sample_weight)
 
         risk_scores = rsf.predict(X_test)
@@ -132,34 +133,35 @@ def predict_recurrence_survival(splits):
         pred_survival_funcs = rsf.predict_survival_function(X_test)
         event_occurred_idx = np.where(y_test == 1)[0]  # Indices where event = 1
         censored_idx = np.where(y_test == 0)[0]  # Indices where event = 0
+        event_curves = pred_survival_funcs[event_occurred_idx]
+
         # num_events = len(event_occurred_idx)  # Count of actual events
         # selected_censored_idx = np.random.choice(censored_idx, size=num_events, replace=False)  # Random selection
-        event_curves = pred_survival_funcs[event_occurred_idx]
         # censored_curves = pred_survival_funcs[selected_censored_idx]
 
         time, survival_prob, conf_int = kaplan_meier_estimator(
             train_surv_data['event'], train_surv_data['time'], conf_type='log-log'
         )
 
-        # # time, survival_prob, conf_int = kaplan_meier_estimator(
-        # #     test_surv_data['event'][censored_idx], test_surv_data['time'][censored_idx], conf_type='log-log'
-        # # )
-        # plt.figure(figsize=(8, 6))
-        # for i, sf in enumerate(event_curves):
-        #     plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="red", alpha=0.7,
-        #              label="Event" if i == 0 else "")
-        # plt.step(time, survival_prob, where="post")
-        # plt.fill_between(time, conf_int[0], conf_int[1], alpha=0.25, step="post")
-        #
-        # # for i, sf in enumerate(censored_curves):
-        # #     plt.step(sf.x, sf(sf.x), where="post", linestyle="--", color="red", alpha=0.7,
-        # #              label="Censored" if i == 0 else "")
-        #
-        # plt.xlabel("Time")
-        # plt.ylabel("Survival Probability")
-        # plt.title(f"Survival Function: Non-Survivors (Red) vs. average. Split: {split_idx}")
-        # plt.legend()
-        # plt.show()
+        # time, survival_prob, conf_int = kaplan_meier_estimator(
+        #     test_surv_data['event'][censored_idx], test_surv_data['time'][censored_idx], conf_type='log-log'
+        # )
+        plt.figure(figsize=(8, 6))
+        for i, sf in enumerate(event_curves):
+            plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="red", alpha=0.7,
+                     label="Event" if i == 0 else "")
+        plt.step(time, survival_prob, where="post")
+        plt.fill_between(time, conf_int[0], conf_int[1], alpha=0.25, step="post")
+
+        # for i, sf in enumerate(censored_curves):
+        #     plt.step(sf.x, sf(sf.x), where="post", linestyle="--", color="red", alpha=0.7,
+        #              label="Censored" if i == 0 else "")
+
+        plt.xlabel("Time")
+        plt.ylabel("Survival Probability")
+        plt.title(f"Survival Function: Non-Survivors (Red) vs. average. Split: {split_idx}")
+        plt.legend()
+        plt.show()
 
         c_index = concordance_index_censored(test_surv_data["event"], test_surv_data["time"], risk_scores)[0]
         print(f'c-score for split {split_idx}: {c_index}')

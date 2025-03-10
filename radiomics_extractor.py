@@ -2,7 +2,12 @@ from radiomics import featureextractor
 import numpy as np
 from fmcib.models import fmcib_model
 import torch
-import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import torchvision.transforms.v2 as T
+
+from extractor_transform import CenterPadTransform
+from fcib_uptune import FCIBUptune, FCIB_OUTPUT_SIZE, NUM_CLASSES
+
 
 class RadiomicsExtractor(object):
     def __init__(self):
@@ -10,6 +15,16 @@ class RadiomicsExtractor(object):
 
     def extract_features(self, mri_path=None, tumor_mask_path=None, image_patch=None):
         pass
+
+    def show_slice(arr_slice, mask=None):
+        plt.figure(figsize=(6, 6))
+        plt.imshow(arr_slice, cmap="gray")
+        if mask is not None:
+            plt.imshow(mask, cmap="Blues", alpha=0.3)
+        plt.axis("off")
+        plt.show()
+
+
 
 
 class PyRadiomicsExtractor(RadiomicsExtractor):
@@ -45,53 +60,56 @@ class FCIBImageExtractor(RadiomicsExtractor):
         self.model = fmcib_model().to(self.device)
         print(f'Running FCBI extractor model on device {self.device}')
         self.target_tensor_size = 50
-
-    def center_pad_tensor(self, input_tensor, target_size):
-        """
-        Centers a smaller 3D tensor into a larger 3D tensor of size (50,50,50).
-        Assumes input_tensor is smaller than target_size.
-
-        Args:
-            input_tensor (torch.Tensor): A 3D tensor of shape (D, H, W)
-            target_size (tuple): Target shape (default: 50,50,50)
-
-        Returns:
-            torch.Tensor: Padded tensor of shape (50,50,50)
-        """
-        input_shape = np.array(input_tensor.shape)  # (D, H, W)
-        interpolate_factor = np.max(input_tensor.shape / np.array(target_size))
-        if interpolate_factor > 1.0:
-            print(f'Performing interpolation of the input image size {input_shape}; factor {interpolate_factor}')
-            input_tensor = F.interpolate(input_tensor.unsqueeze(0).unsqueeze(0), scale_factor=1/interpolate_factor, mode='trilinear')
-            print(f'Size of the interpolated tensor: {input_tensor.shape}')
-            input_tensor = input_tensor.squeeze(0).squeeze(0)
-            input_shape = np.array(input_tensor.shape)
-
-        target_tensor = torch.zeros(target_size, dtype=input_tensor.dtype, device=input_tensor.device)
-
-        print(f'target tensor shape: {target_tensor.shape}, input tensor shape: {input_shape}')
-        # Compute the starting indices for centering
-        start_d = (target_size[0] - input_shape[0]) // 2
-        start_h = (target_size[1] - input_shape[1]) // 2
-        start_w = (target_size[2] - input_shape[2]) // 2
-
-        # Place the input tensor in the center
-        target_tensor[
-        start_d:start_d + input_shape[0],
-        start_h:start_h + input_shape[1],
-        start_w:start_w + input_shape[2]] = input_tensor
-
-        return target_tensor
+        self.transform = T.Compose([ CenterPadTransform(target_size=(
+            self.target_tensor_size, self.target_tensor_size, self.target_tensor_size), do_random_shift=True),
+        ])
 
     def extract_features(self, mri_path=None, tumor_mask_path=None, image_patch=None):
         # image_patch = kwargs.get('image_patch', None)  # Returns None if 'mri' is not provided
         if image_patch is None:
             raise ValueError("image_patch must be provided")
         image_patch_tensor = torch.tensor(image_patch, dtype=torch.float32)
-        target_size = (self.target_tensor_size, self.target_tensor_size,self.target_tensor_size)
-        padded_tensor = self.center_pad_tensor(image_patch_tensor, target_size=target_size)
+        target_size = (self.target_tensor_size, self.target_tensor_size, self.target_tensor_size)
+        padded_tensor = self.transform(image_patch_tensor)
         tensor_in = padded_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
         metrics = self.model(tensor_in).detach().cpu().squeeze().numpy()
+        assert len(metrics.shape) == 1
+        nn_metrics = {f'feature_{i}': metrics[i] for i in range(metrics.shape[0])}
+        return nn_metrics
+
+
+class FCIBTunedImageExtractor(RadiomicsExtractor):
+    def __init__(self, saved_model_path):
+        super(FCIBTunedImageExtractor, self).__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        fcib_config = {'dropout_prob': 0.3,
+              'fcib_output_size': FCIB_OUTPUT_SIZE,
+              'head_interim_size': 30,
+              'num_classes': NUM_CLASSES,
+              'fine_tune_mode': 'full',
+              }
+
+        self.model = FCIBUptune(fcib_config)
+        saved_model = torch.load(saved_model_path)
+        self.model.load_state_dict(saved_model)
+        self.model.to(self.device)
+
+        print(f'Running FCBI fine-tuned extractor model on device {self.device}')
+        self.target_tensor_size = 50
+        self.transform = T.Compose([
+            CenterPadTransform(target_size=(
+                self.target_tensor_size, self.target_tensor_size, self.target_tensor_size), do_random_shift=True),
+            ])
+
+    def extract_features(self, mri_path=None, tumor_mask_path=None, image_patch=None):
+        # image_patch = kwargs.get('image_patch', None)  # Returns None if 'mri' is not provided
+        if image_patch is None:
+            raise ValueError("image_patch must be provided")
+        image_patch_tensor = torch.tensor(image_patch, dtype=torch.float32)
+        padded_tensor = self.transform(image_patch_tensor)
+        tensor_in = padded_tensor.unsqueeze(0).unsqueeze(0).to(self.device)
+        _, metrics_t = self.model(tensor_in)
+        metrics = metrics_t.detach().cpu().squeeze().numpy()
         assert len(metrics.shape) == 1
         nn_metrics = {f'feature_{i}': metrics[i] for i in range(metrics.shape[0])}
         return nn_metrics
