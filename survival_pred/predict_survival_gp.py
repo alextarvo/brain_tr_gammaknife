@@ -4,14 +4,14 @@ from torch.distributions import Poisson, Uniform
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.variational import VariationalStrategy
 from gpytorch.variational import CholeskyVariationalDistribution
-from gpytorch.kernels import LinearKernel
+from gpytorch.kernels import ScaleKernel
 from gpytorch.kernels import RBFKernel
 
 # Implementation of Inference Algorithm in Fernández et al 2016 "Gaussian Processes for Survival Analysis"
 
 # Here we use a Weibull baseline hazard: \lambda_0(t) = 2\beta t^(\alpha-1)
 # For now, we will manually fiddle with these hyperparams, maybe use some random search
-# TODO Perform Guassian Analysis (MCMC) - paper recommends Gamma prior on \beta, Unif(0,2.3) on alpha
+# TODO Perform Guassian Analysis (MCMC) - paper recommends Gamma prior on \beta, Unif(0,2.3) on alpha - implement at Augmentation step
 beta = 1.0
 alpha = 1.5
 
@@ -30,10 +30,40 @@ def Lambda0_inv(u, beta=beta, alpha=alpha):
 def logit(x):
     return torch.logit(x)
 
-# DATA AUGMENTATION
+# GP CLASSIFICATION MODEL
+# We define a variational GP model to classify points as "accepted" (observed event) or "rejected"
+# NOTE - Requires Zero mean and stationary Kernel for Survival Function properties to be ensured
+class SurvivalGPModel(gpytorch.models.ApproximateGP):
+    def __init__(self, inducing_points, num_covariates):
+        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_strategy = VariationalStrategy(
+            self, inducing_points, variational_distribution, learn_inducing_locations=True
+        )
+        super().__init__(variational_strategy)
+        self.mean_module = gpytorch.means.ZeroMean()
+        # TODO work out RBF kernel to have interaction form K((t_1,X_1),(t_2,X_2)) := K_0(s,t) + \sum_i X_1i X_2i K_i(s,t)
+        # Base K(t,s) Kernel
+        self.time_kernel = RBFKernel(active_dims=[0])
+        self.covar_module = self.time_kernel
+
+        # All interaction term Kernels K(X_i, Y_i) * K(t_i,s_i)
+        for i in range(num_covariates):
+            covar_kernel = ScaleKernel(RBFKernel(active_dims=[i+1]))
+            interaction = covar_kernel * self.time_kernel
+            self.covar_module += interaction
+        
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return MultivariateNormal(mean_x, covar_x)
+
+# Since this is a classification model, w Sigmoid Link, need to use Bernoulli Likelihood
+likelihood = gpytorch.likelihoods.BernoulliLikelihood()
+
+# DATA INFERENCE ALGO
 # For each subject with observed time T_i and covariate X_i,
 # sample candidate points from a Poisson process with rate \Gamma_0(T_i) and then transform them.
-def augment_data(T, X, beta=beta, alpha=alpha, num_aug=1, num_epochs=1_000):
+def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=100):
     '''
     T: (N,) tensor of survival times.
     X: (N, d) tensor of covariates.
@@ -55,6 +85,7 @@ def augment_data(T, X, beta=beta, alpha=alpha, num_aug=1, num_epochs=1_000):
     mll = gpytorch.mlls.VariationalELBO(likelihood, model_init, num_data=inputs.shape[0])
 
     # Targets are defined as interactions between X and T - these should all be classified as accepted jumps
+    # TODO When we are dealing with right censored, data, this will be a mixture of 1s and 0s depending on whether censored
     targets = torch.ones(inputs.shape[0])
     
     for epoch in range(num_epochs):
@@ -63,83 +94,60 @@ def augment_data(T, X, beta=beta, alpha=alpha, num_aug=1, num_epochs=1_000):
         loss = -mll(output, targets)
         loss.backward()
         if (epoch+1) % (num_epochs // 10) == 0:
-            print(f"Initial Train: Epoch {epoch+1}/{num_epochs} - Loss: {loss.item():.3f}")
+            print(f"Initial Train: Epoch {epoch+1}/{num_epochs} - Loss: {loss.item()}")
         optimizer.step()
 
-    t_new = torch.Tensor([10.0])
-    x_new = torch.tensor([[0.5, 0.5]])
-    new_input = torch.cat([t_new.unsqueeze(0), x_new], dim=1)
+    # t_new = torch.Tensor([10.0])
+    # x_new = torch.tensor([[0.5, 0.5]])
+    # new_input = torch.cat([t_new.unsqueeze(0), x_new], dim=1)
+    # print(new_input)
 
-    pred = likelihood(model_init(new_input))
-    print(pred.mean.item())
-    print(pred.variance.item())
+    # pred = likelihood(model_init(new_input))
+    # print(pred.mean.item())
+    # print(pred.variance.item())
 
     candidate_times_list = []
     candidate_labels_list = []
     candidate_X_list = []
     N = T.shape[0]
 
-    for _ in range(num_aug):
+    for n in range(num_aug):
         for i in range(N):
             t_i = T[i]
             x_i = X[i]
             # Calculate cumulative hazard at t_i:
             Lambda_t = Lambda0(t_i, beta, alpha)
             # Sample number of candidate points from Poisson(\Gamma_0(t_i))
-            n_i = Poisson(Lambda_t).sample().long().item()
-            if n_i > 0:
-                # Sample n_i points uniformly on [0, \Gamma_0(t_i)]
-                u = Uniform(0, Lambda_t).sample((n_i,))
-                # Map these to candidate times via the inverse cumulative hazard:
-                t_candidates = Lambda0_inv(u, beta, alpha)
-                candidate_times_list.append(t_candidates)
-                candidate_labels_list.append(torch.zeros(n_i))  # rejected (label 0)
-                candidate_X_list.append(x_i.repeat(n_i, 1))
+            n_i = Poisson(Lambda_t).sample().long().item() + 1
+            # Sample n_i points uniformly on [0, \Gamma_0(t_i)]
+            u = Uniform(0, Lambda_t).sample((n_i,))
+            # Map these to candidate times via the inverse cumulative hazard:
+            t_candidates = Lambda0_inv(u, beta, alpha)
+            for t_cand in t_candidates:
+                new_input = torch.cat((t_cand.unsqueeze(0), x_i),dim=0).unsqueeze(0)
+                pred_cand = likelihood(model_init(new_input))
+                u_cand = Uniform(0,1).sample().item()
+                if u_cand < 1 - pred_cand.mean.item():
+                    candidate_times_list.append(t_cand.unsqueeze(0))
+                    candidate_labels_list.append(torch.zeros(1))  # rejected (label 0)
+                    candidate_X_list.append(x_i)
             # Also add the observed event time with label 1:
             candidate_times_list.append(t_i.unsqueeze(0))
             candidate_labels_list.append(torch.ones(1))
-            candidate_X_list.append(x_i.unsqueeze(0))
+            candidate_X_list.append(x_i)
         
-        all_times = torch.cat(candidate_times_list)   # (N_aug,)
-        all_labels = torch.cat(candidate_labels_list)   # (N_aug,)
-        all_X = torch.cat(candidate_X_list)             # (N_aug, d)
+        all_times = torch.stack(candidate_times_list)   # (N_aug,)
+        all_labels = torch.stack(candidate_labels_list)   # (N_aug,)
+        all_X = torch.stack(candidate_X_list)             # (N_aug, d)
+        print(all_times.shape, all_labels.shape, all_X.shape)
     return all_times, all_X, all_labels
 
-# GP CLASSIFICATION MODEL
-# We define a variational GP model to classify points as "accepted" (observed event) or "rejected"
-# NOTE - Requires Zero mean and stationary Kernel for Survival Function properties to be ensured
-class SurvivalGPModel(gpytorch.models.ApproximateGP):
-    def __init__(self, inducing_points, num_covariates):
-        variational_distribution = CholeskyVariationalDistribution(inducing_points.size(0))
-        variational_strategy = VariationalStrategy(
-            self, inducing_points, variational_distribution, learn_inducing_locations=True
-        )
-        super().__init__(variational_strategy)
-        self.mean_module = gpytorch.means.ZeroMean()
-        # TODO work out RBF kernel to have interaction form K((t_1,X_1),(t_2,X_2)) := K_0(s,t) + \sum_i X_1i X_2i K_i(s,t)
-        # Base K(t,s) Kernel
-        self.time_kernel = RBFKernel(active_dims=[0])
-        self.covar_module = self.time_kernel
-
-        # All interaction term Kernels X_i * Y_i * K(t_i,s_i)
-        for i in range(num_covariates):
-            linear_kernel = LinearKernel(active_dims=[i+1])
-            interaction = linear_kernel * self.time_kernel
-            self.covar_module += interaction
-        
-    def forward(self, x):
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return MultivariateNormal(mean_x, covar_x)
-
-# Since this is a classification model, w Sigmoid Link, need to use Bernoulli Likelihood
-likelihood = gpytorch.likelihoods.BernoulliLikelihood()
 
 # Trainnig GP - Since we non-normal likelihood, cannot use ExactGP, use inducing points 
 # Variational Approx of Posterior
 def train_survival_gp(T, X, num_epochs=1_000):
     # Augment the data:
-    aug_times, aug_X, aug_labels = augment_data(T, X, num_aug=1)
+    aug_times, aug_X, aug_labels = inference(T, X, num_aug=1)
     # Combine time and covariates into a single input feature: [t, x_1, ..., x_d]
     inputs = torch.cat([aug_times.unsqueeze(1), aug_X], dim=1)
     targets = aug_labels  # 1 for observed event, 0 for candidate (rejected) points
@@ -153,6 +161,7 @@ def train_survival_gp(T, X, num_epochs=1_000):
     model.train()
     likelihood.train()
     
+    # TODO Implement Bayesian Optimization with Pybo
     optimizer = torch.optim.Adam(list(model.parameters()) + list(likelihood.parameters()), lr=0.01)
     mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=inputs.shape[0])
     
