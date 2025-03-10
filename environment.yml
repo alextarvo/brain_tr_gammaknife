@@ -28,3 +28,4 @@ dependencies:
       - pynrrd
       - pyradiomics # pyradiomics feature extraction
       - foundation-cancer-image-biomarker
+      - gpytorch # Gaussian Processes
