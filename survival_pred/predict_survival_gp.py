@@ -1,3 +1,8 @@
+import numpy as np
+import pandas as pd
+# import sksurv
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 import torch
 import gpytorch
 from torch.distributions import Poisson, Uniform
@@ -6,6 +11,8 @@ from gpytorch.variational import VariationalStrategy
 from gpytorch.variational import CholeskyVariationalDistribution
 from gpytorch.kernels import ScaleKernel
 from gpytorch.kernels import RBFKernel
+
+from tqdm import tqdm
 
 # Implementation of Inference Algorithm in Fernández et al 2016 "Gaussian Processes for Survival Analysis"
 
@@ -42,9 +49,10 @@ likelihood = gpytorch.likelihoods.BernoulliLikelihood()
 
 # Here we use a Weibull baseline hazard: \lambda_0(t) = 2\beta t^(\alpha-1)
 # For now, we will manually fiddle with these hyperparams, maybe use some random search
-# TODO Perform Guassian Analysis (MCMC) - paper recommends Gamma prior on \beta, Unif(0,2.3) on alpha - implement at Augmentation step
-beta = 1.0
-alpha = 1.5
+# TODO Perform Guassian Analysis (MCMC) - paper recommends Gamma prior on \beta, Unif(0,2.3) on alpha, step at implement at Augmentation
+beta = 0.05
+alpha = 0.05
+
 
 def lambda0(t, beta=beta, alpha=alpha):
     # We use the Weibull base Hazard, as it is fairly standard in application 
@@ -64,7 +72,7 @@ def logit(x):
 # DATA INFERENCE ALGO
 # For each subject with observed time T_i and covariate X_i,
 # sample candidate points from a Poisson process with rate \Gamma_0(T_i) and then transform them.
-def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=1_000):
+def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=1_000):
     '''
     T: (N,) tensor of survival times.
     X: (N, d) tensor of covariates.
@@ -74,12 +82,12 @@ def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=1_000):
     # Train on original dataset before performing MCMC with Augmented Data
     # For variational GP, choose inducing points from the data
     inputs = torch.column_stack((T, X))
-    # TODO When we are dealing with right censored, data, this will be a mixture of 1s and 0s depending on whether censored
-    targets = torch.ones(inputs.shape[0])
-    num_inducing = min(30, inputs.shape[0])
+    if targets is None:
+        # TODO When we are dealing with right censored, data, this will be a mixture of 1s and 0s depending on whether censored
+        targets = torch.ones(inputs.shape[0])
+    num_inducing = min(10, inputs.shape[0])
     inducing_idx = torch.randperm(inputs.shape[0])[:num_inducing]
     inducing_points = inputs[inducing_idx]
-    N = T.shape[0]
 
     model = SurvivalGPModel(inducing_points, X.shape[1])
     model.train()
@@ -89,7 +97,7 @@ def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=1_000):
     mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=inputs.shape[0])
 
     # Targets are defined as interactions between X and T - these should all be classified as accepted jumps
-    # TODO Implement a dataloader for batch GP - for the dataset of our size we're prob fine wo it, but good practice
+    # TODO Implement a dataloader for batch GD - for the dataset of our size we're prob fine w/o it, but good practice
     for epoch in range(num_epochs):
         optimizer.zero_grad()
         output = model(inputs)
@@ -108,18 +116,27 @@ def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=1_000):
     # print(pred.mean.item())
     # print(pred.variance.item())
 
-    all_times = T.unsqueeze(1)
-    all_labels = torch.ones(N)
+    all_times = T
+    all_labels = torch.ones(inputs.shape[0])
     all_X = X
 
     candidate_times_list = []
     candidate_labels_list = []
     candidate_X_list = []
 
+    # Let's only run the augmentation loop for data with recurrence
+    full_data = torch.column_stack((T, X, targets))
+    recurrent_data = full_data[full_data[:, -1] == 1]
+
+    recurrent_T = recurrent_data[:,0]
+    recurrent_X = recurrent_data[:,1:-1]
+    N = recurrent_T.shape[0]
+
+
     for n in range(num_aug):
-        for i in range(N):
-            t_i = T[i]
-            x_i = X[i]
+        for i in tqdm(range(N)):
+            t_i = recurrent_T[i]
+            x_i = recurrent_X[i]
             # Calculate cumulative hazard at t_i:
             Lambda_t = Lambda0(t_i, beta, alpha)
             # Sample number of candidate points from Poisson(\Gamma_0(t_i))
@@ -128,10 +145,12 @@ def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=1_000):
             u = Uniform(0, Lambda_t).sample((n_i,))
             # Map these to candidate times via the inverse cumulative hazard:
             t_candidates = Lambda0_inv(u, beta, alpha)
+            print(f'\n Time Sampled: {t_i}, Num Rejects: {n_i}')
             for t_cand in t_candidates:
-                new_input = torch.cat((t_cand.unsqueeze(0), x_i),dim=0).unsqueeze(0)
+                new_input = torch.cat((t_cand.unsqueeze(-1), x_i),dim=-1).unsqueeze(0)
                 likelihood.eval()
-                pred_cand = likelihood(model(new_input))
+                with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                    pred_cand = likelihood(model(new_input))
                 u_cand = Uniform(0,1).sample().item()
                 if u_cand < 1 - pred_cand.mean.item():
                     candidate_times_list.append(t_cand.unsqueeze(0))
@@ -147,16 +166,15 @@ def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=1_000):
         X_n = torch.stack(candidate_X_list)
         T_n = torch.stack(candidate_times_list)
         targets_n = torch.stack(candidate_labels_list).squeeze(1)
-        all_times = torch.cat((all_times, T_n), dim=0)   # (N_aug,)
+        print(all_times.shape, T_n.shape)
+        all_times = torch.cat((all_times, T_n))   # (N_aug,)
         all_labels = torch.cat((all_labels, targets_n), dim=0)   # (N_aug,)
         all_X = torch.cat((all_X, X_n), dim=0)             # (N_aug, d)
 
         inputs = torch.column_stack((all_times, all_X))
-        num_inducing = min(30, inputs.shape[0])
+        num_inducing = max(30, N//5)
         inducing_idx = torch.randperm(inputs.shape[0])[:num_inducing]
         inducing_points = inputs[inducing_idx]
-
-        print(inputs.shape, all_labels.shape)
 
         model.train()
         likelihood.train()
@@ -167,10 +185,10 @@ def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=1_000):
             loss = -mll(output, all_labels)
             loss.backward()
             if (epoch+1) % (num_epochs // 10) == 0:
-                print(f"Augmnentation {n} Train: Epoch {epoch+1}/{num_epochs} - Loss: {loss.item()}")
+                print(f"Augmnentation {n+1} Train: Epoch {epoch+1}/{num_epochs} - Loss: {loss.item()}")
             optimizer.step()
         
-    return model, likelihood
+    return model, likelihood, all_times, all_labels, all_X
 
 
 # # Trainnig GP - Since we non-normal likelihood, cannot use ExactGP, use inducing points 
@@ -205,33 +223,75 @@ def inference(T, X, beta=beta, alpha=alpha, num_aug=10, num_epochs=1_000):
 #         optimizer.step()
 #     return model, likelihood
 
-# Toy example
+def plot_survival(model, likelihood):
+    # For now, we use simple approximation S(t|x) \approx \exp(-\Gamma_0(t) * \sigma(l(t,x)))
+    return None
+
+def predict_recurrence_survival():
+    return None
+
 # TODO Build Data pipeline to feed into Inference Algorithm
-# need to split our patient data 
+# need to split our patient data into (Targets, T, X) where Targets are indicator of recurrance, T
+# is augmented to be time since first image or last recurrance, and X is the matrix of all other covariates
 if __name__ == "__main__":
-    # More complex to data, N patients, with survival times T, two covariates uniformly disted
-    N = 50
-    T = torch.linspace(0.5, 5.0, N)
-    X = torch.rand(N, 2)
+    # Toy Example
+    # # N patients, with survival times T, two covariates uniformly disted
+    # N = 50
+    # T = torch.linspace(0.5, 5.0, N)
+    # X = torch.rand(N, 2)
     
-    # Train the GP classifier using our data augmentation scheme
-    model, likelihood = inference(T, X, num_epochs=100)
+    # # Train the GP classifier using our data augmentation scheme
+    # model, likelihood, cand_times, cand_labels, cand_X = inference(T, X, num_epochs=100)
     
-    # Simplest Possible Inference - single data point
-    # To predict the probability of an event (i.e. the acceptance probability \sigma(l(t,x)))
-    # at a new time t_new and covariate x_new, we form an input and query the GP
-    model.eval()
-    likelihood.eval()
-    t_new = torch.Tensor([10.0])
-    x_new = torch.tensor([[0.5, 0.5]])
-    new_input = torch.cat([t_new.unsqueeze(0), x_new], dim=1)
+    # # Simplest Possible Inference - single data point
+    # # To predict the probability of an event (i.e. the acceptance probability \sigma(l(t,x)))
+    # # at a new time t_new and covariate x_new, we form an input and query the GP
+    # model.eval()
+    # likelihood.eval()
+    # t_new = torch.Tensor([3.0])
+    # x_new = torch.tensor([[0.5, 0.5]])
+    # new_input = torch.cat([t_new.unsqueeze(0), x_new], dim=1)
     
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        pred = likelihood(model(new_input))
-        # pred.mean is our estimate for \sigma(l(t,x)).
-        print(f"Predicted acceptance probability (event) at t={t_new.flatten()}:", pred.mean.item())
+    # with torch.no_grad(), gpytorch.settings.fast_pred_var():
+    #     pred = likelihood(model(new_input))
+    #     # pred.mean is our estimate for \sigma(l(t,x)).
+    #     print(f"Predicted acceptance probability (event) at t={t_new.flatten()}:", pred.mean.item())
     
-        # To obtain a survival probability, one would typically combine this with the baseline hazard
-        # For example, one may compute: S(t|x) \approx \exp(-\Gamma_0(t) * \sigma(l(t,x)))
-        S_t = torch.exp(-Lambda0(t_new) * pred.mean)
-        print(f"Estimated survival probability at t={t_new.flatten()}:", S_t.item())
+    #     # To obtain a survival probability, one would typically combine this with the baseline hazard
+    #     # For example, one may compute: S(t|x) \approx \exp(-\Gamma_0(t) * \sigma(l(t,x)))
+    #     S_t = torch.exp(-Lambda0(t_new) * pred.mean)
+    #     print(f"Estimated survival probability at t={t_new.flatten()}:", S_t.item())
+    #     print(f"Estimated variance at t={t_new.flatten()}:", 
+    #           torch.exp(-Lambda0(t_new) * pred.variance).item())
+
+    # Load in Patient Metrics Data
+    lesion_metrics_file = 'radiomics_metrics.csv'
+    df_lesion_metrics = pd.read_csv(lesion_metrics_file, header=0, index_col=0)
+    # Map target and gender_id to binary indicators
+    df_lesion_metrics['target'] = df_lesion_metrics['MRI_TYPE'].map({'recurrence': 1, 'stable': 0})
+    df_lesion_metrics['gender_id'] = df_lesion_metrics['PATIENT_GENDER'].map({'Male': 1, 'Female': 0})
+
+    # Adjust time representation so that DUR_TO_IMAGE represenets the time since either last recurrance
+    # or measurements have started. Allows us to represent non-recurrant data as right censored data 
+    # Of course there are dubious longitudinal aspects of such an approach that may need to be addressed
+    df_lesion_metrics = df_lesion_metrics.sort_values(['PT_ID', 'DURATION_TO_IMAG'])
+    df_lesion_metrics['group'] = df_lesion_metrics.groupby('PT_ID')['target'].cumsum().shift(1).fillna(0).astype(int)
+    df_lesion_metrics['time'] = df_lesion_metrics.groupby(['PT_ID', 'group'])['DURATION_TO_IMAG'].cumsum()
+
+    target = torch.Tensor(df_lesion_metrics[['target']].copy().values).squeeze(1)
+    T = torch.Tensor(df_lesion_metrics[['time']].copy().values)
+
+    numeric_columns = df_lesion_metrics.drop(
+        columns=['PT_ID', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
+                'PATIENT_GENDER', 'MRI_TYPE', 'DURATION_TO_IMAG', 'PATIENT_GENDER', 'PATIENT_DIAGNOSIS_METS',
+                'LESION_COURSE_NO', 'PATIENT_AGE', 'target', 'group', 'time'])
+    
+    # # As per Alex's idea, want to apply TF-IDF encoding to the text diagnosis data
+    # vectorizer = TfidfVectorizer(lowercase=True, stop_words=['brain','met','mets','with', 'ca', 'gk', 'lesions','op', 'post'])
+    # text_features = vectorizer.fit_transform(df_lesion_metrics["PATIENT_DIAGNOSIS_METS"])
+    # text_features_df = pd.DataFrame(text_features.toarray(), columns=vectorizer.get_feature_names_out())
+
+    X = torch.Tensor(numeric_columns.values)
+
+    inference(T, X, target, num_epochs= 10, num_aug=1)
+    
