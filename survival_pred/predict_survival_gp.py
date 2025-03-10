@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 # import sksurv
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.ensemble import RandomForestClassifier
 
 import torch
 import gpytorch
@@ -53,7 +54,6 @@ likelihood = gpytorch.likelihoods.BernoulliLikelihood()
 beta = 0.05
 alpha = 0.05
 
-
 def lambda0(t, beta=beta, alpha=alpha):
     # We use the Weibull base Hazard, as it is fairly standard in application 
     return 2 * beta * t**(alpha - 1)
@@ -66,8 +66,6 @@ def Lambda0_inv(u, beta=beta, alpha=alpha):
     # Inverse of \Gamma_0(t)
     return (alpha * u / (2 * beta))**(1 / alpha)
 
-def logit(x):
-    return torch.logit(x)
 
 # DATA INFERENCE ALGO
 # For each subject with observed time T_i and covariate X_i,
@@ -166,7 +164,6 @@ def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=
         X_n = torch.stack(candidate_X_list)
         T_n = torch.stack(candidate_times_list)
         targets_n = torch.stack(candidate_labels_list).squeeze(1)
-        print(all_times.shape, T_n.shape)
         all_times = torch.cat((all_times, T_n))   # (N_aug,)
         all_labels = torch.cat((all_labels, targets_n), dim=0)   # (N_aug,)
         all_X = torch.cat((all_X, X_n), dim=0)             # (N_aug, d)
@@ -229,6 +226,64 @@ def plot_survival(model, likelihood):
 
 def predict_recurrence_survival():
     return None
+
+def split_data(X, T, target, train_ratio=0.9, seed=None):
+    """
+    Splits input tensors (X, T, target) into training and testing sets
+    """    
+    # Ensure all tensors have the same number of samples
+    num_samples = X.size(0)
+    
+    shuffled_indices = torch.randperm(num_samples)
+    
+    # Split indices into training and testing
+    split_idx = int(num_samples * train_ratio)
+    train_indices = shuffled_indices[:split_idx]
+    test_indices = shuffled_indices[split_idx:]
+
+    X_train, X_test = X[train_indices], X[test_indices]
+    T_train, T_test = T[train_indices], T[test_indices]
+    target_train, target_test = target[train_indices], target[test_indices]
+
+    test_has_positive = (target_train == 1).any()
+    
+    # if there is no recurrence in training data, reshuffle until there is
+    while not test_has_positive:
+        shuffled_indices = torch.randperm(num_samples)
+
+        split_idx = int(num_samples * train_ratio)
+        train_indices = shuffled_indices[:split_idx]
+        test_indices = shuffled_indices[split_idx:]
+
+        X_train, X_test = X[train_indices], X[test_indices]
+        T_train, T_test = T[train_indices], T[test_indices]
+        target_train, target_test = target[train_indices], target[test_indices]
+
+        test_has_positive = (target_train == 1).any()
+        
+    return X_train, X_test, T_train, T_test, target_train, target_test
+
+def select_variables_rf(X, y, ntrees, max_tree_depth, num_features=20,visualize=False):
+    """
+    Alex's Approach for choosing top variables with a RF classifier
+    """
+    model = RandomForestClassifier(
+        n_estimators=ntrees,
+        max_depth=max_tree_depth).fit(X, y)
+
+    metrics_gini = model.feature_importances_
+    
+    predictor_columns = X.columns.tolist()
+    assert (len(predictor_columns) == len(metrics_gini))
+    features_importance_list = list(zip(metrics_gini, predictor_columns))
+    features_importance_list = sorted(features_importance_list, key=lambda x: abs(x[0]), reverse=True)
+    gini_coefficients_sorted, feature_names_sorted = zip(*features_importance_list)
+
+    top_N_features = feature_names_sorted[0:num_features]
+    top_N_features_gini = gini_coefficients_sorted[0:num_features]
+    top_metrics = X[list(top_N_features)]
+
+    return top_N_features, top_N_features_gini, top_metrics
 
 # TODO Build Data pipeline to feed into Inference Algorithm
 # need to split our patient data into (Targets, T, X) where Targets are indicator of recurrance, T
@@ -293,5 +348,13 @@ if __name__ == "__main__":
 
     X = torch.Tensor(numeric_columns.values)
 
-    inference(T, X, target, num_epochs= 10, num_aug=1)
+    # top_N_features, top_N_featuers_gini, top_metrics = select_variables_rf(
+    #     pd.DataFrame(torch.cat((X, T),dim=1).numpy()), pd.DataFrame(target.unsqueeze(1).numpy()),
+    #     ntrees=20, max_tree_depth=10
+    # )
+
+    X_train, X_test, T_train, T_test, target_train, target_test = split_data(X, T, target, 
+                                                                             train_ratio=0.9, seed=None)
+
+    inference(T_train, X_train, target_train, num_epochs= 10, num_aug=1)
     
