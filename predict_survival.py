@@ -13,6 +13,8 @@ from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 import sklearn.model_selection as ms
 from sklearn.metrics import classification_report
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn import decomposition
+from sklearn.preprocessing import StandardScaler
 
 import sksurv
 from sksurv.nonparametric import kaplan_meier_estimator
@@ -34,6 +36,7 @@ def get_args():
     parser.add_argument('--lesion_metrics_file',
                         help='Path to the clinical info file Brain-TR-GammaKnife-Clinical-Information.xlsx',
                         type=str)
+    parser.add_argument("--pca", action="store_true", help="Do PCA on numeric features")
     args = parser.parse_args()
     return args
 
@@ -74,9 +77,11 @@ def get_random_splits(X, y, n_splits):
     splits = []
     skf = ms.StratifiedKFold(n_splits=n_splits)
     split_no = 1
-    for train, test in skf.split(X, y):
+    for train, test in skf.split(X, y['target']):
         splits.append((X.iloc[train], y.iloc[train], X.iloc[test], y.iloc[test]))
-        print(f'Split: {split_no}, train size: {len(train)}, test size: {len(test)}. Num. positives in train: {sum(y.iloc[train])}, in test: {sum(y.iloc[test])}')
+        no_pos_train = y.iloc[train]['target']
+        no_pos_test = y.iloc[test]['target']
+        print(f'Split: {split_no}, train size: {len(train)}, test size: {len(test)}. Num. positives in train: {sum(no_pos_train)}, in test: {sum(no_pos_test)}')
         split_no += 1
     return splits
 
@@ -98,8 +103,8 @@ def get_random_splits(X, y, n_splits):
 TOP_N_METRICS = 20
 N_SPLITS = 10
 
-def plot_survival_curve(X, y):
-    surv_data=sksurv.util.Surv.from_arrays(event=y,time=X['DURATION_TO_IMAG'])
+def plot_survival_curve(y):
+    surv_data=sksurv.util.Surv.from_arrays(event=y['target'],time=y['DURATION_TO_IMAG'])
     time, survival_prob, conf_int = kaplan_meier_estimator(
         surv_data['event'], surv_data['time'], conf_type='log-log'
     )
@@ -114,15 +119,15 @@ def predict_recurrence_survival(splits):
     c_scores = []
     rsf = RandomSurvivalForest(n_estimators=40, min_samples_leaf=1)
     for split_idx, (X_train, y_train, X_test, y_test) in enumerate(splits):
-        train_surv_data = sksurv.util.Surv.from_arrays(event=y_train, time=X_train['DURATION_TO_IMAG'])
-        test_surv_data = sksurv.util.Surv.from_arrays(event=y_test, time=X_test['DURATION_TO_IMAG'])
-        X_train = X_train.drop(columns=['DURATION_TO_IMAG'])
-        X_test = X_test.drop(columns=['DURATION_TO_IMAG'])
+        train_surv_data = sksurv.util.Surv.from_arrays(event=y_train['target'],time=y_train['DURATION_TO_IMAG'])
+        test_surv_data = sksurv.util.Surv.from_arrays(event=y_test['target'],time=y_test['DURATION_TO_IMAG'])
+        # X_train = X_train.drop(columns=['DURATION_TO_IMAG'])
+        # X_test = X_test.drop(columns=['DURATION_TO_IMAG'])
 
         # Fit model to the current split
         # Weigh "event" samples to 10
         # sample_weight = np.where(y_train == 1, 10.0, 1.0)
-        sample_weight = np.where(y_train == 1, 4.0, 1.0)
+        sample_weight = np.where(y_train['target'] == 1, 4.0, 1.0)
         rsf.fit(X_train, train_surv_data, sample_weight=sample_weight)
 
         risk_scores = rsf.predict(X_test)
@@ -130,38 +135,46 @@ def predict_recurrence_survival(splits):
         #
         # Here, plot Kaplan-Meier scores for survival vs. non-survival
         #
+        # This is a "baseline" curve from tthe test set - all datapoints
+        time, survival_prob, conf_int = kaplan_meier_estimator(
+            train_surv_data['event'], train_surv_data['time'], conf_type='log-log'
+        )
+        # Get predicted survival functions for the "event" cases
         pred_survival_funcs = rsf.predict_survival_function(X_test)
         event_occurred_idx = np.where(y_test == 1)[0]  # Indices where event = 1
-        censored_idx = np.where(y_test == 0)[0]  # Indices where event = 0
         event_curves = pred_survival_funcs[event_occurred_idx]
+
+        censored_idx = np.where(y_test == 0)[0]  # Indices where event = 0
+        censored_curves = pred_survival_funcs[censored_idx]
 
         # num_events = len(event_occurred_idx)  # Count of actual events
         # selected_censored_idx = np.random.choice(censored_idx, size=num_events, replace=False)  # Random selection
         # censored_curves = pred_survival_funcs[selected_censored_idx]
 
-        time, survival_prob, conf_int = kaplan_meier_estimator(
-            train_surv_data['event'], train_surv_data['time'], conf_type='log-log'
-        )
-
         # time, survival_prob, conf_int = kaplan_meier_estimator(
         #     test_surv_data['event'][censored_idx], test_surv_data['time'][censored_idx], conf_type='log-log'
         # )
-        plt.figure(figsize=(8, 6))
-        for i, sf in enumerate(event_curves):
-            plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="red", alpha=0.7,
-                     label="Event" if i == 0 else "")
-        plt.step(time, survival_prob, where="post")
-        plt.fill_between(time, conf_int[0], conf_int[1], alpha=0.25, step="post")
 
+        # plt.figure(figsize=(8, 6))
+        # for i, sf in enumerate(event_curves):
+        #     plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="red", alpha=0.7,
+        #              label="Event" if i == 0 else "")
         # for i, sf in enumerate(censored_curves):
-        #     plt.step(sf.x, sf(sf.x), where="post", linestyle="--", color="red", alpha=0.7,
-        #              label="Censored" if i == 0 else "")
-
-        plt.xlabel("Time")
-        plt.ylabel("Survival Probability")
-        plt.title(f"Survival Function: Non-Survivors (Red) vs. average. Split: {split_idx}")
-        plt.legend()
-        plt.show()
+        #     plt.step(sf.x, sf(sf.x), where="post", linestyle="-", color="green", alpha=0.7,
+        #              label="Event" if i == 0 else "")
+        #
+        # plt.step(time, survival_prob, where="post")
+        # plt.fill_between(time, conf_int[0], conf_int[1], alpha=0.25, step="post")
+        #
+        # # for i, sf in enumerate(censored_curves):
+        # #     plt.step(sf.x, sf(sf.x), where="post", linestyle="--", color="red", alpha=0.7,
+        # #              label="Censored" if i == 0 else "")
+        #
+        # plt.xlabel("Time")
+        # plt.ylabel("Survival Probability")
+        # plt.title(f"Survival Function: Non-Survivors (Red) vs. average. Split: {split_idx}")
+        # plt.legend()
+        # plt.show()
 
         c_index = concordance_index_censored(test_surv_data["event"], test_surv_data["time"], risk_scores)[0]
         print(f'c-score for split {split_idx}: {c_index}')
@@ -192,27 +205,45 @@ if __name__ == "__main__":
     args = get_args()
     df_lesion_metrics = pd.read_csv(args.lesion_metrics_file, header=0, index_col=0)
     df_lesion_metrics['target'] = df_lesion_metrics['MRI_TYPE'].map({'recurrence': 1, 'stable': 0})
-    df_lesion_metrics['gender_id'] = df_lesion_metrics['PATIENT_GENDER'].map({'Male': 1, 'Female': 0})
+    # Get the target for survival analysis
+    y = df_lesion_metrics[['target', 'DURATION_TO_IMAG']].copy()
 
+    numeric_columns = df_lesion_metrics.drop(
+        columns=['PT_ID', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
+                 'PATIENT_GENDER', 'MRI_TYPE', 'DURATION_TO_IMAG', 'PATIENT_GENDER', 'PATIENT_DIAGNOSIS_METS',
+                 'LESION_COURSE_NO', 'PATIENT_AGE', 'target'])
+
+    # Map a gender to a binary variable
+    df_lesion_metrics['gender_id'] = df_lesion_metrics['PATIENT_GENDER'].map({'Male': 1, 'Female': 0})
     # Apply TF-IDF encoding
-    vectorizer = TfidfVectorizer(lowercase=True, stop_words=['brain','met','mets','with', 'ca'])
+    vectorizer = TfidfVectorizer(lowercase=True, stop_words=['brain','met','mets','with', 'ca', 'gk', 'lesions','op', 'post'])
     text_features = vectorizer.fit_transform(df_lesion_metrics["PATIENT_DIAGNOSIS_METS"])
     print(vectorizer.get_feature_names_out())
     text_features_df = pd.DataFrame(text_features.toarray(), columns=vectorizer.get_feature_names_out())
-    df_lesion_metrics = pd.concat([df_lesion_metrics.drop(columns=["PATIENT_DIAGNOSIS_METS"]), text_features_df], axis=1)
+    #df_lesion_metrics = pd.concat([df_lesion_metrics.drop(columns=["PATIENT_DIAGNOSIS_METS"]), text_features_df], axis=1)
 
+    if args.pca:
+        # pca = decomposition.PCA(n_components=3, whiten=True).fit(numeric_columns)
+        scaler = StandardScaler()
+        df_scaled = scaler.fit_transform(numeric_columns)
+        pca = decomposition.PCA()
+        df_pca = pca.fit_transform(df_scaled)
+        cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
+        n_components = np.argmax(cumulative_variance >= 0.95) + 1
+        if n_components < 20:
+            n_components = 20
+        print(f'PCA selected {n_components} components out of {len(numeric_columns.columns)}')
+        selected_components = [f'PC{i}' for i in range(n_components)]
+        numeric_columns = pd.DataFrame(df_pca[:, 0:n_components], columns=selected_components)
 
-    X = df_lesion_metrics.drop(
-        columns=['target', 'PT_ID', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY', #'PATIENT_DIAGNOSIS_METS',
-                 'PATIENT_GENDER', 'MRI_TYPE'])
-    # This is an index column
-    # X = X.iloc[:, 1:]
-    y = df_lesion_metrics['target']
+    X = pd.concat([numeric_columns, df_lesion_metrics[['gender_id', 'PATIENT_AGE']]], axis=1)
+    # X = pd.concat([numeric_columns, text_features_df, df_lesion_metrics[['gender_id', 'PATIENT_AGE']]], axis=1)
+
     # top_N_features, top_N_features_gini, top_metrics = select_variables_rf(
     #     X, y, ntrees=20, max_tree_depth=10)
 
     # Surivval curve averaged across the whole dataset
-    plot_survival_curve(X, y)
+    plot_survival_curve(y)
 
     splits = get_random_splits(X, y, 10)
     predict_recurrence_survival(splits)

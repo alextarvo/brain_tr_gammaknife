@@ -218,8 +218,8 @@ def train(args):
 
         print()
         print(f"Epoch {epoch}")
-        print("Train loss :: {train_loss :.3f}, F1 :: {train_f1 :.3f}, Precision :: {train_precision :.3f}, Recall :: {train_recall :.3f}")
-        print("Eval  loss :: {eval_loss :.3f},  F1 :: {eval_f1 :.3f},  Precision :: {eval_precision :.3f},  Recall :: {eval_recall :.3f}")
+        print(f"Train loss :: {train_loss :.3f}, F1 :: {train_f1 :.3f}, Precision :: {train_precision :.3f}, Recall :: {train_recall :.3f}")
+        print(f"Eval  loss :: {eval_eval_loss :.3f},  F1 :: {eval_f1 :.3f},  Precision :: {eval_precision :.3f},  Recall :: {eval_recall :.3f}")
         print(f'Truth   sample: f{eval_y_true[0:40]}')
         print(f'Predict sample: f{eval_y_pred[0:40]}')
 
@@ -227,6 +227,8 @@ def train(args):
         writer.add_scalar('Evaluation Loss', eval_eval_loss, img_ctr)
         writer.add_scalar('Training F1', train_f1, img_ctr)
         writer.add_scalar('Evaluation F1', eval_f1, img_ctr)
+        writer.add_scalar('Evaluation precision', eval_precision, img_ctr)
+        writer.add_scalar('Evaluation recall', eval_recall, img_ctr)
 
 
     with open('train_summary.txt', "a+") as file:
