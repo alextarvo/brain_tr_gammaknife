@@ -329,12 +329,15 @@ if __name__ == "__main__":
         # capable library.
         mri_path = os.path.join(args.nrrd_dataset_path, patient_course_id, f'{patient_course_id}_MR_t1.nrrd')
         tumor_mask_path = os.path.join(args.nrrd_dataset_path, patient_course_id, f'{lesion_file_name}.nrrd')
+        dose_path = os.path.join(args.nrrd_dataset_path, patient_course_id, f'{patient_course_id}_dose.nrrd')
         # print(f'Loading MRI file {mri_path}, tumor mask: {tumor_mask_path}')
 
         if not os.path.exists(mri_path):
             logging.warning(f'MRI file {mri_path} does not exist!')
         if not os.path.exists(tumor_mask_path):
             logging.warning(f'Tumor file {tumor_mask_path} does not exist!')
+        if not os.path.exists(dose_path):
+            logging.warning(f'Planned dose file {dose_path} does not exist!')
 
         # We could use nrrd, as below. But all the examples are for ITK... so let''s go with ITK
         # tumor_data, tumor_header = nrrd.read(tumor_mask_path)
@@ -343,9 +346,13 @@ if __name__ == "__main__":
         mri_data, mri_image, mri_metadata = read_nrrd_and_metadata(mri_path)
         # Read the tumor mask
         tumor_data, tumor_image, tumor_metadata = read_nrrd_and_metadata(tumor_mask_path)
+        # Read the tumor mask
+        dose_data, dose_image, dose_metadata = read_nrrd_and_metadata(dose_path)
         # Do some sanity check for images and metadata.
         np.testing.assert_array_equal(mri_image.shape, tumor_image.shape)
         assert (vars(mri_metadata) == vars(tumor_metadata))
+        np.testing.assert_array_equal(mri_image.shape, dose_image.shape)
+        assert (vars(mri_metadata) == vars(dose_metadata))
 
         # Make sure metadata same across images
         if prev_mri_metadata is not None:
@@ -374,6 +381,11 @@ if __name__ == "__main__":
                               dims_corrected[1][0]:dims_corrected[1][1],
                               dims_corrected[2][0]: dims_corrected[2][1]
                               ]
+        extracted_dose_slice = tumor_image[
+                               dims_corrected[0][0]:dims_corrected[0][1],
+                               dims_corrected[1][0]:dims_corrected[1][1],
+                               dims_corrected[2][0]: dims_corrected[2][1]
+                               ]
 
         lesion = LesionInfo(patient_id, lesion_id, course_id,
                             mri_image, dims_corrected, extracted_mri_slice, extracted_tumor_slice)
@@ -406,6 +418,7 @@ if __name__ == "__main__":
                 'PT_ID': row['PT_ID'],
                 'LESION_COURSE_NO': row['LESION_COURSE_NO'],
                 'LESION_NO': row['LESION_NO'],
+                'SUMMARY_DOSE': np.sum(extracted_dose_slice),
                 'PATIENT_DIAGNOSIS_METS': row['PATIENT_DIAGNOSIS_METS'],
                 'PATIENT_DIAGNOSIS_PRIMARY': row['PATIENT_DIAGNOSIS_PRIMARY'],
                 'PATIENT_AGE': row['PATIENT_AGE'],
