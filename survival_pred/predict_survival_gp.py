@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 # import sksurv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
@@ -51,8 +52,8 @@ likelihood = gpytorch.likelihoods.BernoulliLikelihood()
 # Here we use a Weibull baseline hazard: \lambda_0(t) = 2\beta t^(\alpha-1)
 # For now, we will manually fiddle with these hyperparams, maybe use some random search
 # TODO Perform Guassian Analysis (MCMC) - paper recommends Gamma prior on \beta, Unif(0,2.3) on alpha, step at implement at Augmentation
-beta = 0.05
-alpha = 0.05
+beta = 4
+alpha = 0.5
 
 def lambda0(t, beta=beta, alpha=alpha):
     # We use the Weibull base Hazard, as it is fairly standard in application 
@@ -224,6 +225,48 @@ def plot_survival(model, likelihood):
     # For now, we use simple approximation S(t|x) \approx \exp(-\Gamma_0(t) * \sigma(l(t,x)))
     return None
 
+def plot_hazard(model, likelihood, X, samps=5):
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # Sample from covariates of three Individuals
+    T_new = torch.linspace(0, 50, 50)
+    unique_ids = X['PT_ID'].unique()
+    sample_ids = np.random.choice(unique_ids, size=samps, replace=False)
+
+    grouped = X[X['PT_ID'].isin(sample_ids)].groupby('PT_ID')
+    samples = grouped.apply(lambda group: group.sample(n=1)).reset_index(drop=True)
+    samples = samples.drop(columns=['PT_ID'])
+    samples = torch.Tensor(samples.values)        
+
+    model.eval()
+    likelihood.eval()
+
+    # Run through timestep of each sample, showing its hazard function
+    for i, sample in enumerate(samples):
+        samp_steps_mean = []
+        samp_steps_var = []
+        base_hazard = []
+        for t_new in T_new:
+            new_input = torch.cat((t_new.unsqueeze(-1), sample),dim=-1).unsqueeze(0)
+            with torch.no_grad():
+                pred_samp_t = likelihood(model(new_input))
+            # Extract both mean an variance of GP, remember we structure this a Base Hazard * GP Hazard
+            samp_steps_mean.append(pred_samp_t.mean.item() * lambda0(t_new.numpy()))
+            samp_steps_var.append(pred_samp_t.variance.item() * lambda0(t_new.numpy()))
+            base_hazard.append(lambda0(t_new.numpy()))
+        ax.plot(np.linspace(0, 50, 50), samp_steps_mean, label=f'ID: {sample_ids[i]}')
+        ax.fill_between(np.linspace(0, 50, 50), lambda0(t_new.numpy()) * samp_steps_var 
+                        + samp_steps_mean, samp_steps_mean - samp_steps_var * lambda0(t_new.numpy()))
+        ax.plot(np.linspace(0, 50, 50), base_hazard)
+
+    ax.set_title('Estimated Hazard Functions using GP Model')
+    ax.set_xlabel('time')
+    ax.set_ylabel('Hazard')
+    plt.legend()
+    plt.grid()
+    plt.savefig('./survival_pred/Hazard_Plot.pdf')
+    return None
+
 def predict_recurrence_survival():
     return None
 
@@ -336,10 +379,12 @@ if __name__ == "__main__":
     target = torch.Tensor(df_lesion_metrics[['target']].copy().values).squeeze(1)
     T = torch.Tensor(df_lesion_metrics[['time']].copy().values)
 
-    numeric_columns = df_lesion_metrics.drop(
-        columns=['PT_ID', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
+    numeric_columns_w_ID = df_lesion_metrics.drop(
+        columns=['LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
                 'PATIENT_GENDER', 'MRI_TYPE', 'DURATION_TO_IMAG', 'PATIENT_GENDER', 'PATIENT_DIAGNOSIS_METS',
                 'LESION_COURSE_NO', 'PATIENT_AGE', 'target', 'group', 'time'])
+        
+    numeric_columns = numeric_columns_w_ID.drop(columns=['PT_ID'])
     
     # # As per Alex's idea, want to apply TF-IDF encoding to the text diagnosis data
     # vectorizer = TfidfVectorizer(lowercase=True, stop_words=['brain','met','mets','with', 'ca', 'gk', 'lesions','op', 'post'])
@@ -356,5 +401,6 @@ if __name__ == "__main__":
     X_train, X_test, T_train, T_test, target_train, target_test = split_data(X, T, target, 
                                                                              train_ratio=0.9, seed=None)
 
-    inference(T_train, X_train, target_train, num_epochs= 10, num_aug=1)
-    
+    model, likelihood, _, _, _ = inference(T_train, X_train, target_train, num_epochs= 10, num_aug=1)
+
+    plot_hazard(model, likelihood, numeric_columns_w_ID)
