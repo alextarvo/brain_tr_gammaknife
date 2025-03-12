@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import torchsurv
+from torchsurv.metrics.cindex import ConcordanceIndex
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
 
@@ -52,8 +52,8 @@ likelihood = gpytorch.likelihoods.BernoulliLikelihood()
 # Here we use a Weibull baseline hazard: \lambda_0(t) = 2\beta t^(\alpha-1)
 # For now, we will manually fiddle with these hyperparams, maybe use some random search
 # TODO Perform Guassian Analysis (MCMC) - paper recommends Gamma prior on \beta, Unif(0,2.3) on alpha, step at implement at Augmentation
-beta = 4
-alpha = 0.75
+beta = 4.5
+alpha = 1.2
 
 def lambda0(t, beta=beta, alpha=alpha):
     # We use the Weibull base Hazard, as it is fairly standard in application 
@@ -139,7 +139,7 @@ def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=
             # Calculate cumulative hazard at t_i:
             Lambda_t = Lambda0(t_i, beta, alpha)
             # Sample number of candidate points from Poisson(\Gamma_0(t_i))
-            n_i = Poisson(Lambda_t).sample().long().item() + 1
+            n_i = (Poisson(Lambda_t).sample().long().item() + 1) // 10
             # Sample n_i points uniformly on [0, \Gamma_0(t_i)]
             u = Uniform(0, Lambda_t).sample((n_i,))
             # Map these to candidate times via the inverse cumulative hazard:
@@ -242,27 +242,27 @@ def plot_hazard(model, likelihood, X, samps=3):
     for i, sample in enumerate(samples):
         x_ax = np.linspace(0.1, 50, 50)
         colors = ['blue', 'green', 'orange']
-        samp_steps_mean = []
-        samp_steps_var = []
-        base_hazard = []
-        for t_new in T_new:
+        samp_steps_mean = np.empty((50))
+        samp_steps_var = np.empty((50))
+        base_hazard = np.empty((50))
+        for j, t_new in enumerate(T_new):
             new_input = torch.cat((t_new.unsqueeze(-1), sample),dim=-1).unsqueeze(0)
             with torch.no_grad():
                 pred_samp_t = likelihood(model(new_input))
             # Extract both mean an variance of GP, remember we structure this a Base Hazard * GP Hazard
-            samp_steps_mean.append(pred_samp_t.mean.item() * lambda0(t_new.numpy()))
-            samp_steps_var.append(np.float64(pred_samp_t.variance.item() * lambda0(t_new.numpy())))
-            base_hazard.append(lambda0(t_new.numpy()))
+            samp_steps_mean[i] = (pred_samp_t.mean.item() * lambda0(t_new.numpy()))
+            samp_steps_var[i] = (pred_samp_t.variance.item() * lambda0(t_new.numpy()))
+            base_hazard[i] = (lambda0(t_new.numpy()))
         ax1.plot(x_ax, samp_steps_mean, label=f'ID: {sample_ids[i]}', c=colors[i])
-        ax1.fill_between(x_ax, np.array(samp_steps_var)/2 + np.array(samp_steps_mean), 
-                        np.array(samp_steps_mean) - np.array(samp_steps_var)/2, color=colors[i], alpha=0.2)
+        ax1.fill_between(x_ax, samp_steps_var/2 + samp_steps_mean, 
+                        samp_steps_mean - samp_steps_var/2, color=colors[i], alpha=0.2)
         # ax.plot(x_ax, base_hazard)
 
         # To obtain a survival probability, one would typically combine this with the baseline hazard
         # For example, one may compute: S(t|x) \approx \exp(-\Gamma_0(t) * \sigma(l(t,x)))
-        ax2.plot(x_ax, np.ones(50) - np.exp(-np.array(samp_steps_mean)), label=f'ID: {sample_ids[i]}', c=colors[i])
-        ax2.fill_between(x_ax, np.ones(50) - np.exp(-(np.array(samp_steps_mean + np.array(samp_steps_var)))), 
-                 np.ones(50) - np.exp(-(np.array(samp_steps_mean - np.array(samp_steps_var)))), color=colors[i], alpha=0.2)
+        ax2.plot(x_ax, np.ones(50) - np.exp(-samp_steps_mean), label=f'ID: {sample_ids[i]}', c=colors[i])
+        ax2.fill_between(x_ax, np.ones(50) - np.exp(-(samp_steps_mean + samp_steps_var)), 
+                 np.ones(50) - np.exp(-(samp_steps_mean - samp_steps_var)), color=colors[i], alpha=0.2)
 
     ax1.set_title('Estimated Hazard Functions using GP Model')
     ax1.set_xlabel('time')
@@ -278,10 +278,6 @@ def plot_hazard(model, likelihood, X, samps=3):
 
     fig1.savefig('./survival_pred/Hazard_Plot.pdf')
     fig2.savefig('./survival_pred/Survival_Plot.pdf')
-    return None
-
-def predict_recurrence_survival():
-    # TODO Use TorchSurvival to get the C-Index
     return None
 
 def split_data(X, T, target, train_ratio=0.9, seed=None):
@@ -302,7 +298,7 @@ def split_data(X, T, target, train_ratio=0.9, seed=None):
     T_train, T_test = T[train_indices], T[test_indices]
     target_train, target_test = target[train_indices], target[test_indices]
 
-    test_has_positive = (target_train == 1).any()
+    test_has_positive = (target_test == 1).any()
     
     # if there is no recurrence in training data, reshuffle until there is
     while not test_has_positive:
@@ -316,7 +312,7 @@ def split_data(X, T, target, train_ratio=0.9, seed=None):
         T_train, T_test = T[train_indices], T[test_indices]
         target_train, target_test = target[train_indices], target[test_indices]
 
-        test_has_positive = (target_train == 1).any()
+        test_has_positive = (target_test == 1).any()
         
     return X_train, X_test, T_train, T_test, target_train, target_test
 
@@ -342,40 +338,9 @@ def select_variables_rf(X, y, ntrees, max_tree_depth, num_features=20,visualize=
 
     return top_N_features, top_N_features_gini, top_metrics
 
-# TODO Build Data pipeline to feed into Inference Algorithm
 # need to split our patient data into (Targets, T, X) where Targets are indicator of recurrance, T
 # is augmented to be time since first image or last recurrance, and X is the matrix of all other covariates
 if __name__ == "__main__":
-    # Toy Example
-    # # N patients, with survival times T, two covariates uniformly disted
-    # N = 50
-    # T = torch.linspace(0.5, 5.0, N)
-    # X = torch.rand(N, 2)
-    
-    # # Train the GP classifier using our data augmentation scheme
-    # model, likelihood, cand_times, cand_labels, cand_X = inference(T, X, num_epochs=100)
-    
-    # # Simplest Possible Inference - single data point
-    # # To predict the probability of an event (i.e. the acceptance probability \sigma(l(t,x)))
-    # # at a new time t_new and covariate x_new, we form an input and query the GP
-    # model.eval()
-    # likelihood.eval()
-    # t_new = torch.Tensor([3.0])
-    # x_new = torch.tensor([[0.5, 0.5]])
-    # new_input = torch.cat([t_new.unsqueeze(0), x_new], dim=1)
-    
-    # with torch.no_grad(), gpytorch.settings.fast_pred_var():
-    #     pred = likelihood(model(new_input))
-    #     # pred.mean is our estimate for \sigma(l(t,x)).
-    #     print(f"Predicted acceptance probability (event) at t={t_new.flatten()}:", pred.mean.item())
-    
-    #     # To obtain a survival probability, one would typically combine this with the baseline hazard
-    #     # For example, one may compute: S(t|x) \approx \exp(-\Gamma_0(t) * \sigma(l(t,x)))
-    #     S_t = torch.exp(-Lambda0(t_new) * pred.mean)
-    #     print(f"Estimated survival probability at t={t_new.flatten()}:", S_t.item())
-    #     print(f"Estimated variance at t={t_new.flatten()}:", 
-    #           torch.exp(-Lambda0(t_new) * pred.variance).item())
-
     # Load in Patient Metrics Data
     lesion_metrics_file = 'radiomics_metrics.csv'
     df_lesion_metrics = pd.read_csv(lesion_metrics_file, header=0, index_col=0)
@@ -413,8 +378,23 @@ if __name__ == "__main__":
     # )
 
     X_train, X_test, T_train, T_test, target_train, target_test = split_data(X, T, target, 
-                                                                             train_ratio=0.9, seed=None)
+                                                                             train_ratio=0.75, seed=None)
+    model, likelihood, _, _, _ = inference(T_train, X_train, target_train, num_epochs= 100, num_aug=2)
 
-    model, likelihood, _, _, _ = inference(T_train, X_train, target_train, num_epochs= 10_000, num_aug=10)
+    # plot_hazard(model, likelihood, numeric_columns_w_ID)
 
-    plot_hazard(model, likelihood, numeric_columns_w_ID)
+    # Get the C-Index on the testing set
+    model.eval()
+    likelihood.eval()
+
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        test = torch.column_stack([T_test, X_test])
+        test_pred = likelihood(model(test))
+    
+    # Now compute the Hazard at testing points and then C-Index
+    hazard_est = lambda0(T_test.squeeze(1)) * test_pred.mean
+    print(hazard_est, '\n', target_test.bool(), '\n',
+           T_test.squeeze(1))
+    cindex = ConcordanceIndex()
+    c_index = cindex(hazard_est, target_test.bool(), T_test.squeeze(1))
+    print(c_index.item())
