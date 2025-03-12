@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from torchsurv.metrics.cindex import ConcordanceIndex
+from sksurv.metrics import concordance_index_censored
+# from torchsurv.metrics.cindex import ConcordanceIndex
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
 
@@ -12,6 +13,7 @@ from gpytorch.distributions import MultivariateNormal
 from gpytorch.variational import VariationalStrategy
 from gpytorch.variational import CholeskyVariationalDistribution
 from gpytorch.kernels import ScaleKernel
+from gpytorch.kernels import LinearKernel
 from gpytorch.kernels import RBFKernel
 
 from tqdm import tqdm
@@ -52,8 +54,8 @@ likelihood = gpytorch.likelihoods.BernoulliLikelihood()
 # Here we use a Weibull baseline hazard: \lambda_0(t) = 2\beta t^(\alpha-1)
 # For now, we will manually fiddle with these hyperparams, maybe use some random search
 # TODO Perform Guassian Analysis (MCMC) - paper recommends Gamma prior on \beta, Unif(0,2.3) on alpha, step at implement at Augmentation
-beta = 4.5
-alpha = 1.2
+beta = 2
+alpha = 1.1
 
 def lambda0(t, beta=beta, alpha=alpha):
     # We use the Weibull base Hazard, as it is fairly standard in application 
@@ -71,7 +73,8 @@ def Lambda0_inv(u, beta=beta, alpha=alpha):
 # DATA INFERENCE ALGO
 # For each subject with observed time T_i and covariate X_i,
 # sample candidate points from a Poisson process with rate \Gamma_0(T_i) and then transform them.
-def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=1_000):
+def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
+               beta=beta, alpha=alpha, num_aug=5, num_epochs=1_000):
     '''
     T: (N,) tensor of survival times.
     X: (N, d) tensor of covariates.
@@ -97,6 +100,7 @@ def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=
 
     # Targets are defined as interactions between X and T - these should all be classified as accepted jumps
     # TODO Implement a dataloader for batch GD - for the dataset of our size we're prob fine w/o it, but good practice
+    test_message = []
     for epoch in range(num_epochs):
         optimizer.zero_grad()
         output = model(inputs)
@@ -104,8 +108,14 @@ def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=
         loss.backward()
         if (epoch+1) % (num_epochs // 10) == 0:
             print(f"Initial Train: Epoch {epoch+1}/{num_epochs} - Loss: {loss.item()}")
+            if X_test is not None and T_test is not None and target_test is not None:
+                output_test = model(torch.column_stack([T_test, X_test]))
+                loss_test = -mll(output_test, targets_test)
+                # Make the training and test losses more readable, seperate them out
+                test_message.append(f'Inital Test: Epoch {epoch+1}/{num_epochs} - Loss: {loss_test.item()}\n')
         optimizer.step()
 
+    for result in test_message: print(result)
     # t_new = torch.Tensor([10.0])
     # x_new = torch.tensor([[0.5, 0.5]])
     # new_input = torch.cat([t_new.unsqueeze(0), x_new], dim=1)
@@ -139,7 +149,7 @@ def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=
             # Calculate cumulative hazard at t_i:
             Lambda_t = Lambda0(t_i, beta, alpha)
             # Sample number of candidate points from Poisson(\Gamma_0(t_i))
-            n_i = (Poisson(Lambda_t).sample().long().item() + 1) // 10
+            n_i = (Poisson(Lambda_t).sample().long().item() + 1)//1
             # Sample n_i points uniformly on [0, \Gamma_0(t_i)]
             u = Uniform(0, Lambda_t).sample((n_i,))
             # Map these to candidate times via the inverse cumulative hazard:
@@ -177,6 +187,7 @@ def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=
         model.train()
         likelihood.train()
 
+        test_message = []
         for epoch in range(num_epochs):
             optimizer.zero_grad()
             output = model(inputs)
@@ -184,7 +195,13 @@ def inference(T, X, targets=None, beta=beta, alpha=alpha, num_aug=5, num_epochs=
             loss.backward()
             if (epoch+1) % (num_epochs // 10) == 0:
                 print(f"Augmnentation {n+1} Train: Epoch {epoch+1}/{num_epochs} - Loss: {loss.item()}")
+                if X_test is not None and T_test is not None and target_test is not None:
+                    output_test = model(torch.column_stack([T_test, X_test]))
+                    loss_test = -mll(output_test, targets_test)
+                    test_message.append(f'Inital Test: Epoch {epoch+1}/{num_epochs} - Loss: {loss_test.item()}\n')
+
             optimizer.step()
+        for result in test_message: print(result)
         
     return model, likelihood, all_times, all_labels, all_X
 
@@ -267,12 +284,14 @@ def plot_hazard(model, likelihood, X, samps=3):
     ax1.set_title('Estimated Hazard Functions using GP Model')
     ax1.set_xlabel('time')
     ax1.set_ylabel('Hazard')
+    ax1.set_ylim([-10,100])
     ax1.legend()
     ax1.grid(True)
 
     ax2.set_title('Estimated Survival Functions using GP Model')
     ax2.set_xlabel('time')
     ax2.set_ylabel('Conditional Cumulative Survival')
+    ax2.set_ylim([-0.5, 1.5])
     ax2.legend()
     ax2.grid(True)
 
@@ -342,7 +361,7 @@ def select_variables_rf(X, y, ntrees, max_tree_depth, num_features=20,visualize=
 # is augmented to be time since first image or last recurrance, and X is the matrix of all other covariates
 if __name__ == "__main__":
     # Load in Patient Metrics Data
-    lesion_metrics_file = 'radiomics_metrics.csv'
+    lesion_metrics_file = 'radiomics_metrics_fcib_uptuned.csv'
     df_lesion_metrics = pd.read_csv(lesion_metrics_file, header=0, index_col=0)
     # Map target and gender_id to binary indicators
     df_lesion_metrics['target'] = df_lesion_metrics['MRI_TYPE'].map({'recurrence': 1, 'stable': 0})
@@ -358,10 +377,11 @@ if __name__ == "__main__":
     target = torch.Tensor(df_lesion_metrics[['target']].copy().values).squeeze(1)
     T = torch.Tensor(df_lesion_metrics[['time']].copy().values)
 
+    # Keep a copy of 
     numeric_columns_w_ID = df_lesion_metrics.drop(
         columns=['LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
-                'PATIENT_GENDER', 'MRI_TYPE', 'DURATION_TO_IMAG', 'PATIENT_GENDER', 'PATIENT_DIAGNOSIS_METS',
-                'LESION_COURSE_NO', 'PATIENT_AGE', 'target', 'group', 'time'])
+                'PATIENT_GENDER', 'MRI_TYPE', 'DURATION_TO_IMAG', 'PATIENT_DIAGNOSIS_METS',
+                'target', 'group', 'time'])
         
     numeric_columns = numeric_columns_w_ID.drop(columns=['PT_ID'])
     
@@ -379,11 +399,13 @@ if __name__ == "__main__":
 
     X_train, X_test, T_train, T_test, target_train, target_test = split_data(X, T, target, 
                                                                              train_ratio=0.75, seed=None)
-    model, likelihood, _, _, _ = inference(T_train, X_train, target_train, num_epochs= 100, num_aug=2)
+    model, likelihood, _, _, _ = inference(T_train, X_train, target_train,
+                                           T_test, X_test, target_test,
+                                            num_epochs= 10, num_aug=2)
 
-    # plot_hazard(model, likelihood, numeric_columns_w_ID)
+    plot_hazard(model, likelihood, numeric_columns_w_ID)
 
-    # Get the C-Index on the testing set
+    # Get the C-Index on the testing set - want to use time dependent version
     model.eval()
     likelihood.eval()
 
@@ -393,8 +415,12 @@ if __name__ == "__main__":
     
     # Now compute the Hazard at testing points and then C-Index
     hazard_est = lambda0(T_test.squeeze(1)) * test_pred.mean
-    print(hazard_est, '\n', target_test.bool(), '\n',
-           T_test.squeeze(1))
-    cindex = ConcordanceIndex()
-    c_index = cindex(hazard_est, target_test.bool(), T_test.squeeze(1))
-    print(c_index.item())
+    print('Hazard Estimation: \n',hazard_est, '\n Reccurence Values: \n', 
+          target_test.bool(), '\n Time to Image: \n', T_test.squeeze(1))
+    c_index = concordance_index_censored(target_test.bool(),
+                                        T_test.squeeze(1), hazard_est)
+    print('\n C-Index over Test Score: ', c_index)
+
+    # Loss of Test data
+    test_loss = gpytorch.metrics.mean_squared_error(test_pred, target_test)
+    print(f'\n Test Loss (Bern Likelihood): {test_loss}')
