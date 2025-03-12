@@ -5,6 +5,8 @@ from sksurv.metrics import concordance_index_censored
 # from torchsurv.metrics.cindex import ConcordanceIndex
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
+from sklearn import decomposition
+from sklearn.preprocessing import StandardScaler
 
 import torch
 import gpytorch
@@ -13,7 +15,7 @@ from gpytorch.distributions import MultivariateNormal
 from gpytorch.variational import VariationalStrategy
 from gpytorch.variational import CholeskyVariationalDistribution
 from gpytorch.kernels import ScaleKernel
-from gpytorch.kernels import LinearKernel
+from gpytorch.kernels import PolynomialKernel
 from gpytorch.kernels import RBFKernel
 
 from tqdm import tqdm
@@ -34,12 +36,13 @@ class SurvivalGPModel(gpytorch.models.ApproximateGP):
         self.mean_module = gpytorch.means.ZeroMean()
         # TODO work out RBF kernel to have interaction form K((t_1,X_1),(t_2,X_2)) := K_0(s,t) + \sum_i X_1i X_2i K_i(s,t)
         # Base K(t,s) Kernel
-        self.time_kernel = RBFKernel(active_dims=[0])
+        self.time_kernel = ScaleKernel(RBFKernel(active_dims=[0]))
         self.covar_module = self.time_kernel
 
         # All interaction term Kernels K(X_i, Y_i) * K(t_i,s_i)
         for i in range(num_covariates):
-            covar_kernel = ScaleKernel(RBFKernel(active_dims=[i+1]))
+            # covar_kernel = ScaleKernel(PolynomialKernel(active_dims=[i+1], power=1))
+            covar_kernel = ScaleKernel(PolynomialKernel(active_dims=[i+1], power=1))
             interaction = covar_kernel * self.time_kernel
             self.covar_module += interaction
         
@@ -112,7 +115,7 @@ def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
                 output_test = model(torch.column_stack([T_test, X_test]))
                 loss_test = -mll(output_test, targets_test)
                 # Make the training and test losses more readable, seperate them out
-                test_message.append(f'Inital Test: Epoch {epoch+1}/{num_epochs} - Loss: {loss_test.item()}\n')
+                test_message.append(f'Inital Test: Epoch {epoch+1}/{num_epochs} - Loss: {loss_test.item()}')
         optimizer.step()
 
     for result in test_message: print(result)
@@ -149,7 +152,7 @@ def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
             # Calculate cumulative hazard at t_i:
             Lambda_t = Lambda0(t_i, beta, alpha)
             # Sample number of candidate points from Poisson(\Gamma_0(t_i))
-            n_i = (Poisson(Lambda_t).sample().long().item() + 1)//1
+            n_i = (Poisson(Lambda_t).sample().long().item() + 1)//10
             # Sample n_i points uniformly on [0, \Gamma_0(t_i)]
             u = Uniform(0, Lambda_t).sample((n_i,))
             # Map these to candidate times via the inverse cumulative hazard:
@@ -198,7 +201,7 @@ def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
                 if X_test is not None and T_test is not None and target_test is not None:
                     output_test = model(torch.column_stack([T_test, X_test]))
                     loss_test = -mll(output_test, targets_test)
-                    test_message.append(f'Inital Test: Epoch {epoch+1}/{num_epochs} - Loss: {loss_test.item()}\n')
+                    test_message.append(f'Augmentation {n+1} Tets: Epoch {epoch+1}/{num_epochs} - Loss: {loss_test.item()}')
 
             optimizer.step()
         for result in test_message: print(result)
@@ -361,7 +364,7 @@ def select_variables_rf(X, y, ntrees, max_tree_depth, num_features=20,visualize=
 # is augmented to be time since first image or last recurrance, and X is the matrix of all other covariates
 if __name__ == "__main__":
     # Load in Patient Metrics Data
-    lesion_metrics_file = 'radiomics_metrics_fcib_uptuned.csv'
+    lesion_metrics_file = 'radiomics_metrics_pyradiomics.csv'
     df_lesion_metrics = pd.read_csv(lesion_metrics_file, header=0, index_col=0)
     # Map target and gender_id to binary indicators
     df_lesion_metrics['target'] = df_lesion_metrics['MRI_TYPE'].map({'recurrence': 1, 'stable': 0})
@@ -370,20 +373,33 @@ if __name__ == "__main__":
     # Adjust time representation so that DUR_TO_IMAGE represenets the time since either last recurrance
     # or measurements have started. Allows us to represent non-recurrant data as right censored data 
     # Of course there are dubious longitudinal aspects of such an approach that may need to be addressed
-    df_lesion_metrics = df_lesion_metrics.sort_values(['PT_ID', 'DURATION_TO_IMAG'])
-    df_lesion_metrics['group'] = df_lesion_metrics.groupby('PT_ID')['target'].cumsum().shift(1).fillna(0).astype(int)
-    df_lesion_metrics['time'] = df_lesion_metrics.groupby(['PT_ID', 'group'])['DURATION_TO_IMAG'].cumsum()
+    # df_lesion_metrics = df_lesion_metrics.sort_values(['PT_ID', 'DURATION_TO_IMAG'])
+    # df_lesion_metrics['group'] = df_lesion_metrics.groupby('PT_ID')['target'].cumsum().shift(1).fillna(0).astype(int)
+    # df_lesion_metrics['time'] = df_lesion_metrics.groupby(['PT_ID', 'group'])['DURATION_TO_IMAG'].cumsum()
 
     target = torch.Tensor(df_lesion_metrics[['target']].copy().values).squeeze(1)
-    T = torch.Tensor(df_lesion_metrics[['time']].copy().values)
+    T = torch.Tensor(df_lesion_metrics[['DURATION_TO_IMAG']].copy().values)
 
-    # Keep a copy of 
-    numeric_columns_w_ID = df_lesion_metrics.drop(
-        columns=['LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
+    # Keep a copy of ID for plotting
+    numeric_columns = df_lesion_metrics.drop(
+        columns=['PT_ID', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
                 'PATIENT_GENDER', 'MRI_TYPE', 'DURATION_TO_IMAG', 'PATIENT_DIAGNOSIS_METS',
-                'target', 'group', 'time'])
-        
-    numeric_columns = numeric_columns_w_ID.drop(columns=['PT_ID'])
+                'target' # , 'group', 'time'
+                ])
+    
+    # pca = decomposition.PCA(n_components=3, whiten=True).fit(numeric_columns)
+    scaler = StandardScaler()
+    df_scaled = scaler.fit_transform(numeric_columns)
+    pca = decomposition.PCA()
+    df_pca = pca.fit_transform(df_scaled)
+    cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
+    n_components = np.argmax(cumulative_variance >= 0.95) + 1
+    # if n_components < 20:
+    #     n_components = 20
+    print(f'PCA selected {n_components} components out of {len(numeric_columns.columns)}')
+    selected_components = [f'PC{i}' for i in range(n_components)]
+    numeric_columns = pd.DataFrame(df_pca[:, 0:n_components], columns=selected_components)
+
     
     # # As per Alex's idea, want to apply TF-IDF encoding to the text diagnosis data
     # vectorizer = TfidfVectorizer(lowercase=True, stop_words=['brain','met','mets','with', 'ca', 'gk', 'lesions','op', 'post'])
@@ -401,9 +417,12 @@ if __name__ == "__main__":
                                                                              train_ratio=0.75, seed=None)
     model, likelihood, _, _, _ = inference(T_train, X_train, target_train,
                                            T_test, X_test, target_test,
-                                            num_epochs= 10, num_aug=2)
+                                            num_epochs= 5_000, num_aug=1)
 
-    plot_hazard(model, likelihood, numeric_columns_w_ID)
+    # Need ID for plotting purposes
+    numeric_columns['PT_ID'] = df_lesion_metrics['PT_ID']
+
+    plot_hazard(model, likelihood, numeric_columns)
 
     # Get the C-Index on the testing set - want to use time dependent version
     model.eval()
@@ -414,12 +433,23 @@ if __name__ == "__main__":
         test_pred = likelihood(model(test))
     
     # Now compute the Hazard at testing points and then C-Index
-    hazard_est = lambda0(T_test.squeeze(1)) * test_pred.mean
+    # hazard_est = lambda0(T_test.squeeze(1)) * test_pred.mean
+    hazard_est = test_pred.mean # * lambda0(T_test.squeeze(1))
     print('Hazard Estimation: \n',hazard_est, '\n Reccurence Values: \n', 
           target_test.bool(), '\n Time to Image: \n', T_test.squeeze(1))
     c_index = concordance_index_censored(target_test.bool(),
                                         T_test.squeeze(1), hazard_est)
     print('\n C-Index over Test Score: ', c_index)
+
+    # Do the same with training data - to see the model was at least fitting training
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        training = torch.column_stack([T_train, X_train])
+        train_pred = likelihood(model(training))
+    
+    hazard_est_train = train_pred.mean
+    c_index_train = concordance_index_censored(target_train.bool(),
+                                        T_train.squeeze(1), hazard_est_train)
+    print(f'\n C-Index over Training Score: {c_index_train}')
 
     # Loss of Test data
     test_loss = gpytorch.metrics.mean_squared_error(test_pred, target_test)
