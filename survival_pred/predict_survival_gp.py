@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sksurv.metrics import concordance_index_censored
-# from torchsurv.metrics.cindex import ConcordanceIndex
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn import decomposition
 from sklearn.preprocessing import StandardScaler
@@ -22,6 +22,10 @@ from tqdm import tqdm
 
 # Implementation of Inference Algorithm in Fernández et al 2016 "Gaussian Processes for Survival Analysis"
 
+# Parameters used in testing
+N_FOLDS = 5
+N_EPOCH = 10
+N_AUG = 0
 
 # GP CLASSIFICATION MODEL
 # We define a variational GP model to classify points as "accepted" (observed event) or "rejected"
@@ -34,7 +38,6 @@ class SurvivalGPModel(gpytorch.models.ApproximateGP):
         )
         super().__init__(variational_strategy)
         self.mean_module = gpytorch.means.ZeroMean()
-        # TODO work out RBF kernel to have interaction form K((t_1,X_1),(t_2,X_2)) := K_0(s,t) + \sum_i X_1i X_2i K_i(s,t)
         # Base K(t,s) Kernel
         self.time_kernel = ScaleKernel(RBFKernel(active_dims=[0]))
         self.covar_module = self.time_kernel
@@ -42,7 +45,7 @@ class SurvivalGPModel(gpytorch.models.ApproximateGP):
         # All interaction term Kernels K(X_i, Y_i) * K(t_i,s_i)
         for i in range(num_covariates):
             # covar_kernel = ScaleKernel(PolynomialKernel(active_dims=[i+1], power=1))
-            covar_kernel = ScaleKernel(PolynomialKernel(active_dims=[i+1], power=1))
+            covar_kernel = ScaleKernel(RBFKernel(active_dims=[i+1], power=1))
             interaction = covar_kernel * self.time_kernel
             self.covar_module += interaction
         
@@ -88,7 +91,6 @@ def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
     # For variational GP, choose inducing points from the data
     inputs = torch.column_stack((T, X))
     if targets is None:
-        # TODO When we are dealing with right censored, data, this will be a mixture of 1s and 0s depending on whether censored
         targets = torch.ones(inputs.shape[0])
     num_inducing = min(10, inputs.shape[0])
     inducing_idx = torch.randperm(inputs.shape[0])[:num_inducing]
@@ -243,13 +245,14 @@ def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
 
 def plot_hazard(model, likelihood, X, samps=3):
     fig1, ax1 = plt.subplots(figsize=(8, 6))
-    fig2, ax2 = plt.subplots(figsize=(8,6))
+    fig2, ax2 = plt.subplots(figsize=(8, 6))
 
     # Sample from covariates of three Individuals
     T_new = torch.linspace(0, 50, 50)
     unique_ids = X['PT_ID'].unique()
     sample_ids = np.random.choice(unique_ids, size=samps, replace=False)
 
+    # Sampling from the datapoints of each ID
     grouped = X[X['PT_ID'].isin(sample_ids)].groupby('PT_ID')
     samples = grouped.apply(lambda group: group.sample(n=1)).reset_index(drop=True)
     samples = samples.drop(columns=['PT_ID'])
@@ -302,41 +305,21 @@ def plot_hazard(model, likelihood, X, samps=3):
     fig2.savefig('./survival_pred/Survival_Plot.pdf')
     return None
 
-def split_data(X, T, target, train_ratio=0.9, seed=None):
+def split_data_indx(X, T, target, splits=5, seed=None):
     """
     Splits input tensors (X, T, target) into training and testing sets
     """    
     # Ensure all tensors have the same number of samples
     num_samples = X.size(0)
+    skf = StratifiedKFold(n_splits=splits)
+    k_split = []
     
-    shuffled_indices = torch.randperm(num_samples)
-    
-    # Split indices into training and testing
-    split_idx = int(num_samples * train_ratio)
-    train_indices = shuffled_indices[:split_idx]
-    test_indices = shuffled_indices[split_idx:]
-
-    X_train, X_test = X[train_indices], X[test_indices]
-    T_train, T_test = T[train_indices], T[test_indices]
-    target_train, target_test = target[train_indices], target[test_indices]
-
-    test_has_positive = (target_test == 1).any()
-    
-    # if there is no recurrence in training data, reshuffle until there is
-    while not test_has_positive:
-        shuffled_indices = torch.randperm(num_samples)
-
-        split_idx = int(num_samples * train_ratio)
-        train_indices = shuffled_indices[:split_idx]
-        test_indices = shuffled_indices[split_idx:]
-
-        X_train, X_test = X[train_indices], X[test_indices]
-        T_train, T_test = T[train_indices], T[test_indices]
-        target_train, target_test = target[train_indices], target[test_indices]
-
-        test_has_positive = (target_test == 1).any()
-        
-    return X_train, X_test, T_train, T_test, target_train, target_test
+    # Split indices into training and testing - ensured these folds are balanced
+    # because of StratifiedKFold
+    for train, test in skf.split(X, target):
+        k_split.append((X[train], T[train], target[train],
+                        X[test], T[test], target[test]))
+    return k_split
 
 def select_variables_rf(X, y, ntrees, max_tree_depth, num_features=20,visualize=False):
     """
@@ -370,32 +353,22 @@ if __name__ == "__main__":
     df_lesion_metrics['target'] = df_lesion_metrics['MRI_TYPE'].map({'recurrence': 1, 'stable': 0})
     df_lesion_metrics['gender_id'] = df_lesion_metrics['PATIENT_GENDER'].map({'Male': 1, 'Female': 0})
 
-    # Adjust time representation so that DUR_TO_IMAGE represenets the time since either last recurrance
-    # or measurements have started. Allows us to represent non-recurrant data as right censored data 
-    # Of course there are dubious longitudinal aspects of such an approach that may need to be addressed
-    # df_lesion_metrics = df_lesion_metrics.sort_values(['PT_ID', 'DURATION_TO_IMAG'])
-    # df_lesion_metrics['group'] = df_lesion_metrics.groupby('PT_ID')['target'].cumsum().shift(1).fillna(0).astype(int)
-    # df_lesion_metrics['time'] = df_lesion_metrics.groupby(['PT_ID', 'group'])['DURATION_TO_IMAG'].cumsum()
-
     target = torch.Tensor(df_lesion_metrics[['target']].copy().values).squeeze(1)
     T = torch.Tensor(df_lesion_metrics[['DURATION_TO_IMAG']].copy().values)
 
-    # Keep a copy of ID for plotting
     numeric_columns = df_lesion_metrics.drop(
         columns=['PT_ID', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
                 'PATIENT_GENDER', 'MRI_TYPE', 'DURATION_TO_IMAG', 'PATIENT_DIAGNOSIS_METS',
                 'target' # , 'group', 'time'
                 ])
     
-    # pca = decomposition.PCA(n_components=3, whiten=True).fit(numeric_columns)
+    # Perform PCA on the features
     scaler = StandardScaler()
     df_scaled = scaler.fit_transform(numeric_columns)
     pca = decomposition.PCA()
     df_pca = pca.fit_transform(df_scaled)
     cumulative_variance = np.cumsum(pca.explained_variance_ratio_)
     n_components = np.argmax(cumulative_variance >= 0.95) + 1
-    # if n_components < 20:
-    #     n_components = 20
     print(f'PCA selected {n_components} components out of {len(numeric_columns.columns)}')
     selected_components = [f'PC{i}' for i in range(n_components)]
     numeric_columns = pd.DataFrame(df_pca[:, 0:n_components], columns=selected_components)
@@ -413,44 +386,54 @@ if __name__ == "__main__":
     #     ntrees=20, max_tree_depth=10
     # )
 
-    X_train, X_test, T_train, T_test, target_train, target_test = split_data(X, T, target, 
-                                                                             train_ratio=0.75, seed=None)
-    model, likelihood, _, _, _ = inference(T_train, X_train, target_train,
-                                           T_test, X_test, target_test,
-                                            num_epochs= 5_000, num_aug=1)
+    # Perform cross-validation on our data
+    C_index = []
+    k_indx = split_data_indx(X, T, target, splits=N_FOLDS, seed=None)
+    print(k_indx)
 
-    # Need ID for plotting purposes
-    numeric_columns['PT_ID'] = df_lesion_metrics['PT_ID']
+    for fold, (X_train, T_train, target_train, X_test, T_test, target_test) in enumerate(k_indx):
 
-    plot_hazard(model, likelihood, numeric_columns)
+        model, likelihood, _, _, _ = inference(T_train, X_train, target_train,
+                                            T_test, X_test, target_test,
+                                                num_epochs=N_EPOCH, num_aug=N_AUG)
 
-    # Get the C-Index on the testing set - want to use time dependent version
-    model.eval()
-    likelihood.eval()
+        # Need ID for plotting purposes
+        # numeric_columns['PT_ID'] = df_lesion_metrics['PT_ID']
+        # plot_hazard(model, likelihood, numeric_columns)
 
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        test = torch.column_stack([T_test, X_test])
-        test_pred = likelihood(model(test))
+        print(f'\n --------------FOLD{ fold}------------------\n')
+
+        # Get the C-Index on the testing set - want to use time dependent version
+        model.eval()
+        likelihood.eval()
+
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            test = torch.column_stack([T_test, X_test])
+            test_pred = likelihood(model(test))
+        
+        # Now compute the Hazard at testing points and then C-Index
+        # hazard_est = lambda0(T_test.squeeze(1)) * test_pred.mean
+        hazard_est = test_pred.mean # * lambda0(T_test.squeeze(1))
+        print('Hazard Estimation: \n',hazard_est, '\n Reccurence Values: \n', 
+            target_test.bool(), '\n Time to Image: \n', T_test.squeeze(1))
+        c_index = concordance_index_censored(target_test.bool(),
+                                            T_test.squeeze(1), hazard_est)
+        C_index.append(c_index)
+        print(f'\n C-Index over Test for Fold {fold}:  {c_index}')
+
+        # Do the same with training data - to see the model was at least fitting training
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            training = torch.column_stack([T_train, X_train])
+            train_pred = likelihood(model(training))
+        
+        hazard_est_train = train_pred.mean # * lambda0(T_train.squeeze(1))
+        c_index_train = concordance_index_censored(target_train.bool(),
+                                            T_train.squeeze(1), hazard_est_train)
+        print(f'\n C-Index over Train for Fold {fold}: {c_index_train}')
+
+        # Loss of Test data
+        test_loss = gpytorch.metrics.mean_squared_error(test_pred, target_test)
+        print(f'\n Test Loss (Bern Likelihood): {test_loss}')
     
-    # Now compute the Hazard at testing points and then C-Index
-    # hazard_est = lambda0(T_test.squeeze(1)) * test_pred.mean
-    hazard_est = test_pred.mean # * lambda0(T_test.squeeze(1))
-    print('Hazard Estimation: \n',hazard_est, '\n Reccurence Values: \n', 
-          target_test.bool(), '\n Time to Image: \n', T_test.squeeze(1))
-    c_index = concordance_index_censored(target_test.bool(),
-                                        T_test.squeeze(1), hazard_est)
-    print('\n C-Index over Test Score: ', c_index)
-
-    # Do the same with training data - to see the model was at least fitting training
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        training = torch.column_stack([T_train, X_train])
-        train_pred = likelihood(model(training))
-    
-    hazard_est_train = train_pred.mean
-    c_index_train = concordance_index_censored(target_train.bool(),
-                                        T_train.squeeze(1), hazard_est_train)
-    print(f'\n C-Index over Training Score: {c_index_train}')
-
-    # Loss of Test data
-    test_loss = gpytorch.metrics.mean_squared_error(test_pred, target_test)
-    print(f'\n Test Loss (Bern Likelihood): {test_loss}')
+    print('\n----------------------Final Results---------------------------\n')
+    print(f'Average C-index across {N_FOLDS}-Folds: {np.average(C_index)}')
