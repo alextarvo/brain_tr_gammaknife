@@ -76,7 +76,7 @@ def get_random_splits(X, y, n_splits):
     Generates stratified train-test splits while ensuring at least `min_recurrent` recurrent patients in training.
     """
     splits = []
-    skf = ms.StratifiedKFold(n_splits=n_splits)
+    skf = ms.StratifiedKFold(n_splits=n_splits, shuffle=True)
     split_no = 1
     for train, test in skf.split(X, y['target']):
         splits.append((X.iloc[train], y.iloc[train], X.iloc[test], y.iloc[test]))
@@ -171,27 +171,34 @@ def predict_recurrence_survival(splits):
         test_surv_data = sksurv.util.Surv.from_arrays(event=y_test['target'], time=y_test['DURATION_TO_IMAG'])
 
         # Best for PyRadiomics + PCA:
+        #  PyRadiomics+PCA 200/30: 0.642 (0.02)
+        #                  200/10: 0.600
         # rsf = RandomSurvivalForest(n_estimators=200,
-        #                            max_depth=10,
-        #                            max_features="sqrt",
-        #                            bootstrap=True)
-
-        # Best for fine-tuned model
-        # rsf = RandomSurvivalForest(n_estimators=500,
-        #                            min_samples_split=max(10, int(0.05 * len(y_train))),
-        #                            min_samples_leaf=max(5, int(0.02 * len(y_train))),
         #                            max_depth=30,
         #                            max_features="sqrt",
         #                            bootstrap=True)
 
-        # rsf = RandomSurvivalForest(n_estimators=40, min_samples_leaf=1)
-        # rsf = RandomSurvivalForest(n_estimators=40,
-        rsf = RandomSurvivalForest(n_estimators=800,
-                                   min_samples_split=max(10, int(0.05 * len(y_train))),
-                                   min_samples_leaf=max(5, int(0.02 * len(y_train))),
-                                   max_depth=30,
+        # Best for:
+        #  PyRadiomics+PCA 500/30: 0.634
+        #                  500/10: 0.639
+        rsf = RandomSurvivalForest(n_estimators=500,
+                                   # min_samples_split=max(10, int(0.05 * len(y_train))),
+                                   # min_samples_leaf=max(5, int(0.02 * len(y_train))),
+                                   max_depth=10,
                                    max_features="sqrt",
                                    bootstrap=True)
+
+        # rsf = RandomSurvivalForest(n_estimators=40, min_samples_leaf=1)
+        # rsf = RandomSurvivalForest(n_estimators=40,
+
+        #  PyRadiomics+PCA 800/30: 0.637
+        #                  800/10:
+        # rsf = RandomSurvivalForest(n_estimators=800,
+        #                            # min_samples_split=max(10, int(0.05 * len(y_train))),
+        #                            # min_samples_leaf=max(5, int(0.02 * len(y_train))),
+        #                            max_depth=10,
+        #                            max_features="sqrt",
+        #                            bootstrap=True)
 
         # Fit model to the current split
         # Weigh "event" samples to 10
@@ -281,8 +288,15 @@ if __name__ == "__main__":
     df_lesion_metrics['gender_id'] = df_lesion_metrics['PATIENT_GENDER'].map({'Male': 1, 'Female': 0})
     # Apply TF-IDF encoding
     vectorizer = TfidfVectorizer(lowercase=True,
-                                 stop_words=['brain', 'met', 'mets', 'with', 'ca', 'gk', 'lesions', 'op', 'post'])
-    text_features = vectorizer.fit_transform(df_lesion_metrics["PATIENT_DIAGNOSIS_METS"])
+                                 # stop_words=['brain', 'met', 'mets', 'with', 'ca', 'gk', 'lesions', 'op', 'post'])
+                                 stop_words=['brain', 'met', 'mets', 'with', 'ca', 'gk', 'lesions', 'op', 'post',
+                                             'cancer', 'in', 'left', 'right', 'of', 'the','unspecified'])
+    text_features = vectorizer.fit_transform(
+        df_lesion_metrics["PATIENT_DIAGNOSIS_METS"].fillna('') + " " +
+        df_lesion_metrics["PATIENT_DIAGNOSIS_PRIMARY"].fillna(''))
+    # text_features = vectorizer.fit_transform(
+    #     df_lesion_metrics["PATIENT_DIAGNOSIS_METS"].fillna('') )
+
     print(vectorizer.get_feature_names_out())
     text_features_df = pd.DataFrame(text_features.toarray(), columns=vectorizer.get_feature_names_out())
     # df_lesion_metrics = pd.concat([df_lesion_metrics.drop(columns=["PATIENT_DIAGNOSIS_METS"]), text_features_df], axis=1)
@@ -301,8 +315,8 @@ if __name__ == "__main__":
         selected_components = [f'PC{i}' for i in range(n_components)]
         numeric_columns = pd.DataFrame(df_pca[:, 0:n_components], columns=selected_components)
 
-    X = pd.concat([numeric_columns, df_lesion_metrics[['gender_id', 'SUMMARY_DOSE', 'PATIENT_AGE']]], axis=1)
-    # X = pd.concat([numeric_columns, text_features_df, df_lesion_metrics[['gender_id', 'PATIENT_AGE']]], axis=1)
+    # X = pd.concat([numeric_columns, df_lesion_metrics[['gender_id', 'SUMMARY_DOSE', 'PATIENT_AGE']]], axis=1)
+    X = pd.concat([numeric_columns, text_features_df, df_lesion_metrics[['gender_id', 'SUMMARY_DOSE', 'PATIENT_AGE']]], axis=1)
 
     # top_N_features, top_N_features_gini, top_metrics = select_variables_rf(
     #     X, y, ntrees=20, max_tree_depth=10)
@@ -311,11 +325,11 @@ if __name__ == "__main__":
     plot_survival_curve(y)
 
     splits = get_random_splits(X, y, 10)
-    predict_recurrence_classification(splits)
-    #
-    # all_c_scores = []
-    # for i in range(10):
-    #     avg_c_score = predict_recurrence_survival(splits)
-    #     all_c_scores.append(avg_c_score)
-    # print(f'Final c-score, averaged across runs: mean {np.mean(all_c_scores)}, std. dev {np.std(all_c_scores)}')
-    #
+    # predict_recurrence_classification(splits)
+
+    all_c_scores = []
+    for i in range(10):
+        avg_c_score = predict_recurrence_survival(splits)
+        all_c_scores.append(avg_c_score)
+    print(f'Final c-score, averaged across runs: mean {np.mean(all_c_scores)}, std. dev {np.std(all_c_scores)}')
+
