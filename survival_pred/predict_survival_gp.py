@@ -23,8 +23,8 @@ from tqdm import tqdm
 # Implementation of Inference Algorithm in Fernández et al 2016 "Gaussian Processes for Survival Analysis"
 
 # Parameters used in testing
-N_FOLDS = 5
-N_EPOCH = 10
+N_FOLDS = 10
+N_EPOCH = 1_000
 N_AUG = 0
 
 # GP CLASSIFICATION MODEL
@@ -39,7 +39,7 @@ class SurvivalGPModel(gpytorch.models.ApproximateGP):
         super().__init__(variational_strategy)
         self.mean_module = gpytorch.means.ZeroMean()
         # Base K(t,s) Kernel
-        self.time_kernel = ScaleKernel(RBFKernel(active_dims=[0]))
+        self.time_kernel = ScaleKernel(PolynomialKernel(active_dims=[0], power=1))
         self.covar_module = self.time_kernel
 
         # All interaction term Kernels K(X_i, Y_i) * K(t_i,s_i)
@@ -79,7 +79,7 @@ def Lambda0_inv(u, beta=beta, alpha=alpha):
 # DATA INFERENCE ALGO
 # For each subject with observed time T_i and covariate X_i,
 # sample candidate points from a Poisson process with rate \Gamma_0(T_i) and then transform them.
-def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
+def inference(T, X, targets, T_test, X_test, targets_test,
                beta=beta, alpha=alpha, num_aug=5, num_epochs=1_000):
     '''
     T: (N,) tensor of survival times.
@@ -105,30 +105,39 @@ def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
 
     # Targets are defined as interactions between X and T - these should all be classified as accepted jumps
     # TODO Implement a dataloader for batch GD - for the dataset of our size we're prob fine w/o it, but good practice
-    test_message = []
+    train_message = []
     for epoch in range(num_epochs):
+        likelihood.train()
         optimizer.zero_grad()
         output = model(inputs)
         loss = -mll(output, targets)
         loss.backward()
         if (epoch+1) % (num_epochs // 10) == 0:
-            print(f"Initial Train: Epoch {epoch+1}/{num_epochs} - Loss: {loss.item()}")
-            if X_test is not None and T_test is not None and target_test is not None:
-                output_test = model(torch.column_stack([T_test, X_test]))
-                loss_test = -mll(output_test, targets_test)
-                # Make the training and test losses more readable, seperate them out
-                test_message.append(f'Inital Test: Epoch {epoch+1}/{num_epochs} - Loss: {loss_test.item()}')
+            likelihood.eval()
+            model.eval()
+
+            # Calculate C-Indexes in training
+            with torch.no_grad():                
+                test = model(torch.column_stack([T_test, X_test]))
+                prediction_test = likelihood(test)
+
+                train = model(torch.column_stack([T_train, X_train]))
+                prediction_train = likelihood(train)
+
+            hazard_est_test = prediction_test.mean
+            c_test = concordance_index_censored(target_test.bool(),
+                                            T_test.squeeze(1), hazard_est_test)
+            print(f'Initial Test: Epoch {epoch+1}/{num_epochs} - C-Index: {c_test[0]}')
+            # Make the training and test losses more readable, seperate them out by putting training
+            # in an array and printing at the end
+            hazard_est_train = prediction_train.mean
+            c_train = concordance_index_censored(target_train.bool(),
+                                            T_train.squeeze(1), hazard_est_train)
+
+            train_message.append(f'Inital Train: Epoch {epoch+1}/{num_epochs} - C-Index: {c_train[0]}')
         optimizer.step()
 
-    for result in test_message: print(result)
-    # t_new = torch.Tensor([10.0])
-    # x_new = torch.tensor([[0.5, 0.5]])
-    # new_input = torch.cat([t_new.unsqueeze(0), x_new], dim=1)
-    # print(new_input)
-
-    # pred = likelihood(model_init(new_input))
-    # print(pred.mean.item())
-    # print(pred.variance.item())
+    for result in train_message: print(result)
 
     all_times = T
     all_labels = torch.ones(inputs.shape[0])
@@ -170,10 +179,6 @@ def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
                     candidate_times_list.append(t_cand.unsqueeze(0))
                     candidate_labels_list.append(torch.zeros(1))  # rejected (label 0)
                     candidate_X_list.append(x_i)
-            # Also add the observed event time with label 1:
-            # candidate_times_list.append(t_i.unsqueeze(0))
-            # candidate_labels_list.append(torch.ones(1))
-            # candidate_X_list.append(x_i)
 
         # TODO Refactor this training process, this is ugly code
         # Update GP params with the rejected datapoints
@@ -185,7 +190,7 @@ def inference(T, X, targets=None, T_test=None, X_test=None, targets_test=None,
         all_X = torch.cat((all_X, X_n), dim=0)             # (N_aug, d)
 
         inputs = torch.column_stack((all_times, all_X))
-        num_inducing = max(30, N//5)
+        num_inducing = N//5
         inducing_idx = torch.randperm(inputs.shape[0])[:num_inducing]
         inducing_points = inputs[inducing_idx]
 
@@ -311,7 +316,7 @@ def split_data_indx(X, T, target, splits=5, seed=None):
     """    
     # Ensure all tensors have the same number of samples
     num_samples = X.size(0)
-    skf = StratifiedKFold(n_splits=splits)
+    skf = StratifiedKFold(n_splits=splits, shuffle=True)
     k_split = []
     
     # Split indices into training and testing - ensured these folds are balanced
@@ -359,9 +364,9 @@ if __name__ == "__main__":
     numeric_columns = df_lesion_metrics.drop(
         columns=['PT_ID', 'LESION_NO', 'PATIENT_DIAGNOSIS_PRIMARY',
                 'PATIENT_GENDER', 'MRI_TYPE', 'DURATION_TO_IMAG', 'PATIENT_DIAGNOSIS_METS',
-                'target' # , 'group', 'time'
+                'target'
                 ])
-    
+        
     # Perform PCA on the features
     scaler = StandardScaler()
     df_scaled = scaler.fit_transform(numeric_columns)
@@ -389,7 +394,6 @@ if __name__ == "__main__":
     # Perform cross-validation on our data
     C_index = []
     k_indx = split_data_indx(X, T, target, splits=N_FOLDS, seed=None)
-    print(k_indx)
 
     for fold, (X_train, T_train, target_train, X_test, T_test, target_test) in enumerate(k_indx):
 
@@ -397,11 +401,12 @@ if __name__ == "__main__":
                                             T_test, X_test, target_test,
                                                 num_epochs=N_EPOCH, num_aug=N_AUG)
 
-        # Need ID for plotting purposes
-        # numeric_columns['PT_ID'] = df_lesion_metrics['PT_ID']
-        # plot_hazard(model, likelihood, numeric_columns)
+        if fold == len(k_indx):
+            # Need ID for plotting purposes
+            numeric_columns['PT_ID'] = df_lesion_metrics['PT_ID']
+            plot_hazard(model, likelihood, numeric_columns)
 
-        print(f'\n --------------FOLD{ fold}------------------\n')
+        print(f'\n --------------FOLD {fold}------------------\n')
 
         # Get the C-Index on the testing set - want to use time dependent version
         model.eval()
@@ -416,10 +421,10 @@ if __name__ == "__main__":
         hazard_est = test_pred.mean # * lambda0(T_test.squeeze(1))
         print('Hazard Estimation: \n',hazard_est, '\n Reccurence Values: \n', 
             target_test.bool(), '\n Time to Image: \n', T_test.squeeze(1))
-        c_index = concordance_index_censored(target_test.bool(),
+        c_index_test = concordance_index_censored(target_test.bool(),
                                             T_test.squeeze(1), hazard_est)
-        C_index.append(c_index)
-        print(f'\n C-Index over Test for Fold {fold}:  {c_index}')
+        C_index.append(c_index_test[0])
+        print(f'\n C-Index over Test for Fold {fold}:  {c_index_test}')
 
         # Do the same with training data - to see the model was at least fitting training
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
@@ -433,7 +438,7 @@ if __name__ == "__main__":
 
         # Loss of Test data
         test_loss = gpytorch.metrics.mean_squared_error(test_pred, target_test)
-        print(f'\n Test Loss (Bern Likelihood): {test_loss}')
+        print(f'\nTest Loss on Fold {fold} (Bern Likelihood)\n: {test_loss}')
     
-    print('\n----------------------Final Results---------------------------\n')
+    print('\n----------------------Final Results-------------------------\n')
     print(f'Average C-index across {N_FOLDS}-Folds: {np.average(C_index)}')
